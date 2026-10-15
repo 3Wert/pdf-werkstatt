@@ -20,6 +20,8 @@ extension NSToolbarItem.Identifier {
     static let zoom = Self("zoom")
     static let share = Self("teilen")
     static let search = Self("suche")
+    static let insertGroup = Self("einsetzen")
+    static let styleGroup = Self("stil")
 }
 
 enum SidebarMode: Int { case none = 0, thumbnails, outline, annotations, bookmarks, contactSheet }
@@ -38,6 +40,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     private var modeGroup: NSToolbarItemGroup?
     private var strokeItem: NSToolbarItem?
     private var fillItem: NSToolbarItem?
+    private var styleGroupItem: NSToolbarItemGroup?
+    private var shareButton: NSButton?
+    private var sharePicker: NSSharingServicePicker?
     private var infoPanel: InfoPanel?
     private var popover: NSPopover?
     private(set) var sidebarMode: SidebarMode = .thumbnails
@@ -89,7 +94,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         w.contentViewController = split
         w.setContentSize(NSSize(width: 1320, height: 880))
 
-        let tb = NSToolbar(identifier: "PDFWerkstattToolbar3")
+        let tb = NSToolbar(identifier: "PDFWerkstattToolbar4")
         tb.delegate = self
         tb.displayMode = .iconOnly
         tb.allowsUserCustomization = true
@@ -180,12 +185,12 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     // MARK: Werkzeugleiste – eine Reihe, immer sichtbar
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarMenu, .sidebarTrackingSeparator, .modes, .space, .shapes, .textBox, .note, .signature, .image, .pageNumbers, .space,
-         .lineStyle, .strokeColor, .fillColor, .textStyle, .flexibleSpace, .highlight, .rotate, .zoom, .share, .search]
+        [.sidebarMenu, .sidebarTrackingSeparator, .modes, .space, .shapes, .signature, .insertGroup, .space,
+         .styleGroup, .flexibleSpace, .highlight, .rotate, .zoom, .share, .search]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        toolbarDefaultItemIdentifiers(toolbar) + [.print, .toggleInspector]
+        toolbarDefaultItemIdentifiers(toolbar) + [.textBox, .note, .image, .pageNumbers, .lineStyle, .strokeColor, .fillColor, .textStyle, .print, .toggleInspector]
     }
 
     private func button(_ id: NSToolbarItem.Identifier, _ label: String, _ symbol: String, _ action: Selector, tip: String? = nil) -> NSToolbarItem {
@@ -217,7 +222,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         case .sidebarMenu:
             return menuItem(id, "Seitenleiste", "sidebar.left", menu: sidebarModeMenu(), action: #selector(toggleSidebarButton(_:)))
         case .modes:
-            let tips = ["Textauswahl", "Bildausschnitt auswählen (⌘C kopiert als Bild)",
+            let tips = ["Textauswahl", "Bereich auswählen – Rahmen ziehen: ⌫ löscht alles darin, Ziehen verschiebt, ⌘C kopiert als Bild",
                         "Zuschneiden – Rahmen aufziehen, Enter schneidet zu",
                         "PDF-Inhalt bearbeiten – Klick wählt Text/Bild/Linie (⌫ löscht, Ziehen verschiebt), Doppelklick ändert Text",
                         "Abdecken – Rechteck über den Bereich ziehen", "Zeichnen (Freihand)",
@@ -226,9 +231,35 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
                                        selectionMode: .selectOne, labels: modes.map { $0.title }, target: self, action: #selector(modePicked(_:)))
             g.label = "Werkzeug"
             g.controlRepresentation = .expanded
+            g.visibilityPriority = .high
             for (i, sub) in g.subitems.enumerated() { sub.toolTip = tips[i] }
             g.selectedIndex = 0
             modeGroup = g
+            return g
+        case .insertGroup:
+            // Fällt bei schmalem Fenster automatisch zu einem Menü zusammen
+            let g = NSToolbarItemGroup(itemIdentifier: id)
+            g.subitems = [button(.textBox, "Text", "character.textbox", #selector(insertTextBox(_:)), tip: "Neues Textfeld"),
+                          button(.note, "Notiz", "note.text", #selector(insertNote(_:))),
+                          button(.image, "Bild", "photo", #selector(insertImage(_:)), tip: "Bild einfügen …"),
+                          button(.pageNumbers, "Seitenzahlen", "number", #selector(pageNumbers(_:)), tip: "Seitenzahlen …")]
+            g.label = "Einsetzen"
+            g.paletteLabel = "Einsetzen"
+            g.controlRepresentation = .automatic
+            return g
+        case .styleGroup:
+            let g = NSToolbarItemGroup(itemIdentifier: id)
+            let st = button(.strokeColor, "Rahmenfarbe", "square", #selector(strokeColorPopover(_:)))
+            let fi = button(.fillColor, "Füllfarbe", "square.fill", #selector(fillColorPopover(_:)))
+            strokeItem = st; fillItem = fi
+            g.subitems = [button(.lineStyle, "Formstil", "line.3.horizontal", #selector(lineStylePopover(_:)), tip: "Linienstärke, gestrichelt, Schatten"),
+                          st, fi,
+                          button(.textStyle, "Textstil", "textformat", #selector(textStylePopover(_:)), tip: "Schrift, Größe, Textfarbe")]
+            g.label = "Stil"
+            g.paletteLabel = "Stil"
+            g.controlRepresentation = .automatic
+            styleGroupItem = g
+            refreshStyleItems()
             return g
         case .shapes:
             return menuItem(id, "Formen", "square.on.circle", menu: shapesMenu(), action: nil)
@@ -263,18 +294,28 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
             highlightItem = it
             return it
         case .rotate:
-            return button(id, "Drehen", "rotate.left", #selector(rotateLeft(_:)), tip: "Seite nach links drehen (⌥-Klick: rechts)")
+            let it = button(id, "Drehen", "rotate.left", #selector(rotateLeft(_:)), tip: "Seite nach links drehen (⌥-Klick: rechts)")
+            it.visibilityPriority = .low
+            return it
         case .zoom:
             let g = NSToolbarItemGroup(itemIdentifier: id, images: [
                 NSImage(systemSymbolName: "minus.magnifyingglass", accessibilityDescription: "Verkleinern")!,
                 NSImage(systemSymbolName: "plus.magnifyingglass", accessibilityDescription: "Vergrößern")!,
             ], selectionMode: .momentary, labels: ["Verkleinern", "Vergrößern"], target: self, action: #selector(zoomGroup(_:)))
             g.label = "Zoomen"
+            g.visibilityPriority = .low
             return g
         case .share:
-            let it = NSSharingServicePickerToolbarItem(itemIdentifier: id)
+            // eigener Knopf: vor dem Teilen auf nur abgedeckte Stellen prüfen
+            let it = NSToolbarItem(itemIdentifier: id)
+            let b = NSButton(image: NSImage(systemSymbolName: "square.and.arrow.up", accessibilityDescription: "Teilen")!, target: self, action: #selector(shareClicked(_:)))
+            b.bezelStyle = .toolbar
+            b.toolTip = "Teilen"
+            shareButton = b
+            it.view = b
             it.label = "Teilen"
-            it.delegate = self
+            it.paletteLabel = "Teilen"
+            it.visibilityPriority = .low
             return it
         case .search:
             let it = NSSearchToolbarItem(itemIdentifier: id)
@@ -324,7 +365,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         let p = NSPopover()
         p.behavior = .transient
         p.contentViewController = vc
-        p.show(relativeTo: item)
+        // Unterpunkte einer Gruppe haben keinen eigenen Platz in der Leiste – an der Gruppe verankern
+        let anchor: NSToolbarItem = (window?.toolbar?.items.contains { $0 === item } == true) ? item : (styleGroupItem ?? item)
+        p.show(relativeTo: anchor)
         popover = p
     }
 
@@ -345,6 +388,26 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     }
 
     // MARK: Teilen
+
+    @objc func shareClicked(_ b: NSButton) {
+        guard let d = wdoc, let w = window else { return }
+        canvas.endEditing()
+        var items: [Any]
+        switch SendCheck.run(doc: d, window: w, verb: "Teilen") {
+        case .cancel: return
+        case .rasterize:
+            let u = shareURL.deletingPathExtension().appendingPathExtension("pdf")
+            guard let doc = PDFDocument(data: PDFTools.rasterized(d.pdf, dpi: CGFloat(prefs.integer(forKey: "exportDpi") == 0 ? 300 : prefs.integer(forKey: "exportDpi")))) else { return }
+            doc.write(to: u)
+            items = [u]
+        case .proceed:
+            if let u = d.fileURL, !d.isDocumentEdited { items = [u] }
+            else { if let data = try? d.data(ofType: "com.adobe.pdf") { try? data.write(to: shareURL) }; items = [shareURL] }
+        }
+        let p = NSSharingServicePicker(items: items)
+        sharePicker = p
+        p.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+    }
 
     private var shareURL: URL {
         let name = ((wdoc?.displayName ?? "Dokument") as NSString).deletingPathExtension + ".pdf"

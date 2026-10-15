@@ -458,11 +458,75 @@ final class PDFFile {
         return out
     }
 
+    /// Ressourcen einer Seite – auch geerbt vom übergeordneten Seitenbaum
+    func pageResources(_ num: Int) -> [String: PDFObj] {
+        var n: Int? = num
+        var seen = Set<Int>()
+        while let cur = n, !seen.contains(cur), let d = object(cur)?.dictValue {
+            seen.insert(cur)
+            if let r = d["Resources"], let rd = resolve(r).dictValue { return rd }
+            if case .ref(let pn, _)? = d["Parent"] { n = pn } else { n = nil }
+        }
+        return [:]
+    }
+
+    /// Alle Objekte, die von `o` aus erreichbar sind (ohne /Parent – sonst hängt der ganze Seitenbaum dran)
+    func closure(of o: PDFObj) -> Set<Int> {
+        var out = Set<Int>()
+        var stack: [PDFObj] = [o]
+        while let x = stack.popLast() {
+            switch x {
+            case .ref(let n, _):
+                if out.insert(n).inserted, let obj = object(n) { stack.append(obj) }
+            case .array(let a): stack += a
+            case .dict(let d): for (k, v) in d where k != "Parent" { stack.append(v) }
+            case .stream(let d, _): for (k, v) in d where k != "Parent" { stack.append(v) }
+            default: break
+            }
+        }
+        return out
+    }
+
+    /// Kleines eigenständiges PDF: eine Seite pro Inhalt, alle mit den Ressourcen der Originalseite.
+    /// Bilder und Schriften stehen nur einmal drin – viel schneller als pro Element eine Kopie der ganzen Datei.
+    func standalone(pageObj: Int, contents: [[UInt8]], mediaBox: CGRect) -> Data? {
+        let res = pageResources(pageObj)
+        let objs = closure(of: .dict(res)).sorted()
+        var out = Array("%PDF-1.7\n%\u{00E2}\u{00E3}\n".utf8)
+        var offs: [(Int, Int)] = []
+        func emit(_ n: Int, _ o: PDFObj) {
+            offs.append((n, out.count))
+            out += Array("\(n) 0 obj\n".utf8); out += PDFWriter.serialize(o); out += Array("\nendobj\n".utf8)
+        }
+        for n in objs { if let o = object(n) { emit(n, o) } }
+        let base = max(maxObj, objs.last ?? 0) + 1
+        let cat = base, pages = base + 1, resNum = base + 2
+        emit(resNum, .dict(res))
+        let mb: PDFObj = .array([.real(Double(mediaBox.minX)), .real(Double(mediaBox.minY)), .real(Double(mediaBox.maxX)), .real(Double(mediaBox.maxY))])
+        var kids: [PDFObj] = []
+        for (i, c) in contents.enumerated() {
+            let cn = base + 3 + 2 * i, pn = cn + 1
+            emit(cn, .stream([:], c))
+            emit(pn, .dict(["Type": .name("Page"), "Parent": .ref(pages, 0), "MediaBox": mb, "Resources": .ref(resNum, 0), "Contents": .ref(cn, 0)]))
+            kids.append(.ref(pn, 0))
+        }
+        emit(pages, .dict(["Type": .name("Pages"), "Kids": .array(kids), "Count": .int(kids.count)]))
+        emit(cat, .dict(["Type": .name("Catalog"), "Pages": .ref(pages, 0)]))
+        let xref = out.count
+        out += Array("xref\n0 1\n0000000000 65535 f \n".utf8)
+        for (n, off) in offs.sorted(by: { $0.0 < $1.0 }) { out += Array("\(n) 1\n".utf8); out += Array(String(format: "%010d 00000 n \n", off).utf8) }
+        let size = (offs.map { $0.0 }.max() ?? 0) + 1
+        out += Array("trailer\n".utf8); out += PDFWriter.serialize(.dict(["Size": .int(size), "Root": .ref(cat, 0)]))
+        out += Array("\nstartxref\n\(xref)\n%%EOF\n".utf8)
+        return Data(out)
+    }
+
     // MARK: Schreiben (inkrementelle Aktualisierung)
 
     /// Neue Datei: Seite `num` bekommt den Inhalt `content` (unkomprimiert). Alles andere bleibt.
-    func updated(page num: Int, content: [UInt8]) -> Data? {
+    func updated(page num: Int, content: [UInt8], extra: [String: PDFObj] = [:]) -> Data? {
         guard var pd = object(num)?.dictValue else { return nil }
+        for (k, v) in extra { pd[k] = v }
         let newNum = maxObj + 1
         pd["Contents"] = .ref(newNum, 0)
         var out = bytes
@@ -663,18 +727,34 @@ final class ContentStream {
 
     // MARK: Ausgabe
 
-    enum Edit { case remove(Int), move(Int, CGFloat, CGFloat), isolate(Int) }
+    enum Edit { case remove(Int), move(Int, CGFloat, CGFloat), isolate(Int), replace(Int, [UInt8]), dissolve(Int) }
+
+    /// Gibt den Strom mit umbenannten Ressourcennamen aus (für das Einbetten einer Gruppe in die Seite)
+    func renamed(_ map: [String: String]) -> [UInt8] {
+        var out: [UInt8] = []
+        for (t, tok) in tokens.enumerated() {
+            if tok.op == "BI", t > 0, case .string(let raw) = tokens[t - 1].obj { out += Array("BI ".utf8); out += raw; out += Array(" EI\n".utf8); continue }
+            if t + 1 < tokens.count, tokens[t + 1].op == "BI" { continue }
+            if case .name(let n) = tok.obj, let r = map[n] { out += PDFWriter.serialize(.name(r)) }
+            else { out += PDFWriter.serialize(tok.obj) }
+            out.append(tok.isOp ? 0x0A : 0x20)
+        }
+        return out
+    }
 
     /// Erzeugt den Inhaltsstrom mit Änderungen. `isolate(k)`: nur Element k sichtbar (für die Vermessung).
     func render(_ edits: [Edit]) -> [UInt8] {
         var removes = Set<Int>()
         var moves: [Int: (CGFloat, CGFloat)] = [:]
+        var replaces: [Int: [UInt8]] = [:]
         var isolate: Int? = nil
         for e in edits {
             switch e {
             case .remove(let k): removes.insert(k)
             case .move(let k, let dx, let dy): moves[k] = (dx, dy)
             case .isolate(let k): isolate = k
+            case .replace(let k, let b): replaces[k] = b
+            case .dissolve: break        // wird von PageContentModel in .replace übersetzt
             }
         }
         if let iso = isolate { for k in elements.indices where k != iso { removes.insert(k) } }
@@ -695,7 +775,10 @@ final class ContentStream {
             if let k = byStart[i] {
                 let e = elements[k]
                 let opTok = tokens[e.tokens.upperBound - 1].op ?? ""
-                if removes.contains(k) {
+                if let rep = replaces[k] {
+                    out += rep
+                    out.append(0x0A)
+                } else if removes.contains(k) {
                     switch e.kind {
                     case .text:
                         if e.canRemove {
@@ -744,51 +827,89 @@ final class ContentStream {
 // MARK: - Seitenmodell mit Vermessung
 
 final class PageContentModel {
-    let file: PDFFile
-    let pageObj: Int
     let pageIndex: Int
     let stream: ContentStream
     private(set) var elements: [ContentElement]
     let mediaBox: CGRect
+    let contentHash: Int
+    /// Grund, falls die Vermessung übersprungen wurde (zu groß)
+    private(set) var note: String?
 
-    init?(data: Data, pageIndex: Int) {
+    static func hash(_ b: [UInt8]) -> Int { var h = Hasher(); h.combine(b.count); b.withUnsafeBytes { h.combine(bytes: $0) }; return h.finalize() }
+
+    /// Modell für Seite `pageIndex` aus einer geöffneten Datei. `reuse`: vorhandenes Modell, falls der Inhalt gleich ist.
+    static func load(file f: PDFFile, pageIndex: Int, reuse: PageContentModel?) -> PageContentModel? {
+        let pages = f.pageObjects()
+        guard pageIndex < pages.count, let c = f.content(ofPage: pages[pageIndex]) else { return nil }
+        let h = hash(c)
+        if let r = reuse, r.contentHash == h, r.pageIndex == pageIndex { return r }
+        return PageContentModel(file: f, pageObj: pages[pageIndex], pageIndex: pageIndex, content: c, hash: h)
+    }
+
+    convenience init?(data: Data, pageIndex: Int) {
         guard let f = try? PDFFile(data: data) else { return nil }
         let pages = f.pageObjects()
         guard pageIndex < pages.count, let c = f.content(ofPage: pages[pageIndex]) else { return nil }
-        file = f
-        pageObj = pages[pageIndex]
+        self.init(file: f, pageObj: pages[pageIndex], pageIndex: pageIndex, content: c, hash: PageContentModel.hash(c))
+    }
+
+    private init(file f: PDFFile, pageObj: Int, pageIndex: Int, content c: [UInt8], hash: Int) {
         self.pageIndex = pageIndex
+        contentHash = hash
         stream = ContentStream(c)
         elements = stream.elements
         var mb = CGRect(x: 0, y: 0, width: 612, height: 792)
-        if let d = f.object(pageObj)?.dictValue, let a = f.resolve(d["MediaBox"] ?? .null).arrayValue, a.count == 4 {
-            let v = a.map { f.resolve($0).doubleValue ?? 0 }
-            mb = CGRect(x: min(v[0], v[2]), y: min(v[1], v[3]), width: abs(v[2] - v[0]), height: abs(v[3] - v[1]))
+        var n: Int? = pageObj
+        var seen = Set<Int>()
+        while let cur = n, !seen.contains(cur), let d = f.object(cur)?.dictValue {
+            seen.insert(cur)
+            if let a = f.resolve(d["MediaBox"] ?? .null).arrayValue, a.count == 4 {
+                let v = a.map { f.resolve($0).doubleValue ?? 0 }
+                mb = CGRect(x: min(v[0], v[2]), y: min(v[1], v[3]), width: abs(v[2] - v[0]), height: abs(v[3] - v[1]))
+                break
+            }
+            if case .ref(let pn, _)? = d["Parent"] { n = pn } else { n = nil }
         }
         mediaBox = mb
-        measure()
+        // Gruppen (Form-XObjects) erkennen
+        let xobjs = f.resolve(f.pageResources(pageObj)["XObject"] ?? .null).dictValue ?? [:]
+        for k in elements.indices where elements[k].kind == .image {
+            if let x = xobjs[elements[k].name], let d = f.resolve(x).dictValue, f.resolve(d["Subtype"] ?? .null).nameValue == "Form" {
+                elements[k].kind = .form
+            }
+        }
+        measure(f, pageObj: pageObj)
     }
 
-    /// Bestimmt die Bounding-Box jedes Elements durch isoliertes Rendern in niedriger Auflösung.
-    private func measure() {
-        let scale: CGFloat = 0.5   // 36 dpi
+    /// Bounding-Box jedes Elements: alle isolierten Varianten als Seiten EINER kleinen Datei rendern.
+    private func measure(_ f: PDFFile, pageObj: Int) {
+        let total = elements.count
+        guard total > 0 else { return }
+        let bytesPerVariant = stream.tokens.count * 8
+        if total * bytesPerVariant > 160_000_000 || total > 2500 { note = "Seite zu komplex (\(total) Elemente)"; return }
+        let scale: CGFloat = total > 600 ? 0.33 : 0.5
         let w = Int(ceil(mediaBox.width * scale)), h = Int(ceil(mediaBox.height * scale))
         guard w > 0, h > 0, w * h < 4_000_000 else { return }
-        func raster(_ content: [UInt8]) -> [UInt8]? {
-            guard let data = file.updated(page: pageObj, content: content),
-                  let prov = CGDataProvider(data: data as CFData), let doc = CGPDFDocument(prov), let pg = doc.page(at: pageIndex + 1),
-                  let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return nil }
+        var variants = [stream.render(elements.indices.map { .remove($0) })]
+        for k in elements.indices { variants.append(stream.render([.isolate(k)])) }
+        guard let data = f.standalone(pageObj: pageObj, contents: variants, mediaBox: mediaBox),
+              let prov = CGDataProvider(data: data as CFData), let doc = CGPDFDocument(prov) else { note = "Vermessung fehlgeschlagen"; return }
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGImageAlphaInfo.none.rawValue), let buf = ctx.data?.bindMemory(to: UInt8.self, capacity: w * h) else { return }
+        func raster(_ i: Int) -> [UInt8]? {
+            guard let pg = doc.page(at: i + 1) else { return nil }
+            ctx.saveGState()
             ctx.setFillColor(gray: 1, alpha: 1)
             ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
             ctx.scaleBy(x: scale, y: scale)
             ctx.translateBy(x: -mediaBox.minX, y: -mediaBox.minY)
             ctx.drawPDFPage(pg)
-            guard let p = ctx.data else { return nil }
-            return Array(UnsafeBufferPointer(start: p.bindMemory(to: UInt8.self, capacity: w * h), count: w * h))
+            ctx.restoreGState()
+            return Array(UnsafeBufferPointer(start: buf, count: w * h))
         }
-        guard let blank = raster(stream.render(elements.indices.map { .remove($0) })) else { return }
+        guard let blank = raster(0) else { return }
         for k in elements.indices {
-            guard let img = raster(stream.render([.isolate(k)])) else { continue }
+            guard let img = raster(k + 1) else { continue }
             var minX = w, minY = h, maxX = -1, maxY = -1
             for y in 0..<h {
                 let row = y * w
@@ -798,7 +919,6 @@ final class PageContentModel {
                 }
             }
             if maxX >= minX {
-                // Bitmap-Zeile 0 = oben
                 let r = CGRect(x: CGFloat(minX) / scale + mediaBox.minX, y: CGFloat(h - 1 - maxY) / scale + mediaBox.minY,
                                width: CGFloat(maxX - minX + 1) / scale, height: CGFloat(maxY - minY + 1) / scale)
                 elements[k].bounds = r.insetBy(dx: -1, dy: -1)
@@ -817,17 +937,74 @@ final class PageContentModel {
         return best
     }
 
-    /// Elemente, deren Box überwiegend innerhalb eines Rechtecks liegt
-    func elements(in r: CGRect) -> [Int] {
+    /// Elemente, deren Box überwiegend (> share) innerhalb eines Rechtecks liegt
+    func elements(in r: CGRect, share: CGFloat = 0.5) -> [Int] {
         elements.indices.filter { k in
             let b = elements[k].bounds
             guard !b.isNull else { return false }
             let i = b.intersection(r)
-            return !i.isNull && i.width * i.height > 0.5 * b.width * b.height
+            return !i.isNull && i.width * i.height > share * max(b.width * b.height, 0.01)
         }
     }
 
-    func apply(_ edits: [ContentStream.Edit]) -> Data? {
-        file.updated(page: pageObj, content: stream.render(edits))
+    /// Wie stark ein Element von einem Rechteck überdeckt ist (0…1)
+    func coverage(_ k: Int, by r: CGRect) -> CGFloat {
+        let b = elements[k].bounds
+        guard !b.isNull else { return 0 }
+        let i = b.intersection(r)
+        return i.isNull ? 0 : (i.width * i.height) / max(b.width * b.height, 0.01)
+    }
+
+    /// Änderungen auf einen frischen Stand des Dokuments anwenden. nil, wenn sich der Seiteninhalt inzwischen geändert hat.
+    func apply(_ edits: [ContentStream.Edit], to data: Data) -> Data? {
+        guard let f = try? PDFFile(data: data) else { return nil }
+        let pages = f.pageObjects()
+        guard pageIndex < pages.count, let c = f.content(ofPage: pages[pageIndex]), PageContentModel.hash(c) == contentHash else { return nil }
+        let pageObj = pages[pageIndex]
+        var final: [ContentStream.Edit] = []
+        var resources = f.pageResources(pageObj)
+        var resChanged = false
+        for e in edits {
+            guard case .dissolve(let k) = e else { final.append(e); continue }
+            guard let (snippet, newRes) = dissolveSnippet(k, file: f, resources: resources) else { return nil }
+            resources = newRes; resChanged = true
+            final.append(.replace(k, snippet))
+        }
+        var extra: [String: PDFObj] = [:]
+        if resChanged { extra["Resources"] = .dict(resources) }
+        return f.updated(page: pageObj, content: stream.render(final), extra: extra)
+    }
+
+    /// Gruppe (Form-XObject) in die Seite einbetten: Inhalt mit Matrix und Begrenzung, Ressourcen mit Präfix übernommen.
+    private func dissolveSnippet(_ k: Int, file f: PDFFile, resources: [String: PDFObj]) -> ([UInt8], [String: PDFObj])? {
+        let el = elements[k]
+        guard el.kind == .form, let xs = f.resolve(resources["XObject"] ?? .null).dictValue, let xo = xs[el.name] else { return nil }
+        let form = f.resolve(xo)
+        guard let fd = form.dictValue, let fc = f.decoded(form) else { return nil }
+        let prefix = "G\(k)x"
+        var res = resources
+        var map: [String: String] = [:]
+        if let fr = f.resolve(fd["Resources"] ?? .null).dictValue {
+            for (cat, val) in fr {
+                guard var dst = f.resolve(res[cat] ?? .dict([:])).dictValue, let src = f.resolve(val).dictValue else { continue }
+                for (name, v) in src {
+                    let nn = prefix + name
+                    map[name] = nn
+                    dst[nn] = v
+                }
+                res[cat] = .dict(dst)
+            }
+        }
+        var out = Array("q\n".utf8)
+        if let m = f.resolve(fd["Matrix"] ?? .null).arrayValue, m.count == 6 {
+            out += Array(m.map { fmt(f.resolve($0).doubleValue ?? 0) }.joined(separator: " ").utf8); out += Array(" cm\n".utf8)
+        }
+        if let b = f.resolve(fd["BBox"] ?? .null).arrayValue, b.count == 4 {
+            let v = b.map { f.resolve($0).doubleValue ?? 0 }
+            out += Array("\(fmt(min(v[0], v[2]))) \(fmt(min(v[1], v[3]))) \(fmt(abs(v[2] - v[0]))) \(fmt(abs(v[3] - v[1]))) re W n\n".utf8)
+        }
+        out += ContentStream(fc).renamed(map)
+        out += Array("Q".utf8)
+        return (out, res)
     }
 }

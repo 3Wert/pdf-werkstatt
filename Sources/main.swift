@@ -8,9 +8,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Log.trim()
         Log.w("--- Start \(Bundle.main.infoDictionary?["CFBundleVersion"] ?? "") ---")
+        UndoStore.purge()
         SelfTest.runIfRequested()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            if ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil { Recovery.offerRestore() }
             if NSDocumentController.shared.documents.isEmpty { NSDocumentController.shared.openDocument(nil) }
         }
     }
@@ -23,6 +26,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showLog(_ s: Any?) { NSWorkspace.shared.open(Log.url) }
+    @objc func toggleVerboseLog(_ s: NSMenuItem) {
+        prefs.set(!prefs.bool(forKey: "protokollAusfuehrlich"), forKey: "protokollAusfuehrlich")
+    }
+
+    func validateMenuItem(_ m: NSMenuItem) -> Bool {
+        if m.action == #selector(toggleVerboseLog(_:)) { m.state = prefs.bool(forKey: "protokollAusfuehrlich") ? .on : .off }
+        return true
+    }
+
     @objc func clearLog(_ s: Any?) { try? "".write(to: Log.url, atomically: true, encoding: .utf8) }
 
     @objc func mergePDFs(_ s: Any?) {
@@ -233,6 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let help = sub("Hilfe")
         add(help, "Protokoll anzeigen", #selector(showLog(_:)))
         add(help, "Protokoll leeren", #selector(clearLog(_:)))
+        add(help, "Protokoll ausführlich", #selector(toggleVerboseLog(_:)))
 
         let win = sub("Fenster")
         add(win, "Im Dock ablegen", #selector(NSWindow.performMiniaturize(_:)), "m")

@@ -4,8 +4,16 @@ import UniformTypeIdentifiers
 
 @objc(WDocument)
 final class WDocument: NSDocument {
-    var pdf: PDFDocument!
+    var pdf: PDFDocument! { didSet { generation += 1 } }
     var password: String?
+
+    /// Zählt jede Änderung – Grundlage für Zwischenspeicher (Bytes, Inhaltsmodelle) und Sicherheitskopien
+    private(set) var generation = 0
+    private var cachedData: (Int, Data)?
+    private var recoveryGeneration = -1
+    private var recoveryTimer: Timer?
+    let recoveryID = UUID().uuidString
+    func touch() { generation += 1 }
 
     override class var autosavesInPlace: Bool { false }
     override class var readableTypes: [String] { ["com.adobe.pdf"] }
@@ -20,6 +28,36 @@ final class WDocument: NSDocument {
             pdf.insert(PDFTools.blankPage(size: PDFTools.a4), at: 0)
         }
         addWindowController(MainWindowController(document: self))
+        if let um = undoManager {
+            for n in [NSNotification.Name.NSUndoManagerDidCloseUndoGroup, .NSUndoManagerDidUndoChange, .NSUndoManagerDidRedoChange] {
+                NotificationCenter.default.addObserver(self, selector: #selector(changed), name: n, object: um)
+            }
+        }
+        recoveryTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in self?.writeRecovery() }
+    }
+
+    @objc private func changed() { generation += 1 }
+
+    /// Sicherheitskopie, wenn sich seit der letzten etwas geändert hat
+    func writeRecovery() {
+        guard isDocumentEdited, generation != recoveryGeneration, controller?.canvas.isEditingText != true,
+              let data = DrawMode.full({ pdf.dataRepresentation() }) else { return }
+        recoveryGeneration = generation
+        Recovery.write(id: recoveryID, data: data, name: displayName ?? "Dokument", original: fileURL)
+        Log.v("Sicherheitskopie geschrieben (\(data.count) Bytes)")
+    }
+
+    override func save(to url: URL, ofType typeName: String, for op: NSDocument.SaveOperationType, completionHandler: @escaping (Error?) -> Void) {
+        super.save(to: url, ofType: typeName, for: op) { [weak self] err in
+            if err == nil, let self, op != .autosaveElsewhereOperation { Recovery.remove(id: self.recoveryID); self.recoveryGeneration = self.generation }
+            completionHandler(err)
+        }
+    }
+
+    override func close() {
+        recoveryTimer?.invalidate()
+        Recovery.remove(id: recoveryID)
+        super.close()
     }
 
     override func read(from data: Data, ofType typeName: String) throws {
@@ -60,10 +98,10 @@ final class WDocument: NSDocument {
 
     // MARK: Seiten (mit Widerrufen)
 
-    func pagesChanged() { Log.w("pagesChanged"); controller?.pagesChanged() }
+    func pagesChanged() { generation += 1; Log.v("pagesChanged"); controller?.pagesChanged() }
 
     func insertPage(_ p: PDFPage, at i: Int, action: String? = nil) {
-        Log.w("insertPage at \(i) \(action ?? "")")
+        Log.v("insertPage at \(i) \(action ?? "")")
         let idx = max(0, min(i, pdf.pageCount))
         pdf.insert(p, at: idx)
         hydrate(page: p)
@@ -174,7 +212,10 @@ final class WDocument: NSDocument {
     /// Aktueller Stand als Bytes (inkl. aller eigenen Objekte) – Grundlage für Eingriffe in den Seiteninhalt
     func currentData() -> Data? {
         controller?.canvas.endEditing()
-        return DrawMode.full { pdf.dataRepresentation() }
+        if let (g, d) = cachedData, g == generation { return d }
+        guard let d = DrawMode.full({ pdf.dataRepresentation() }) else { return nil }
+        cachedData = (generation, d)
+        return d
     }
 
     /// Dokument durch neue Bytes ersetzen (nach direktem Eingriff in den Inhalt). Widerrufbar über die alten Bytes.
@@ -184,7 +225,15 @@ final class WDocument: NSDocument {
         let idx = controller?.canvas.currentPage.map { pdf.index(for: $0) } ?? 0
         pdf = d
         controller?.documentReplaced(pageIndex: idx)
-        undoManager?.registerUndo(withTarget: self) { $0.replaceData(old, old: new, action: action) }
+        // Alter Stand auf die Platte statt in den Speicher (bei 20 MB und zehn Schritten sonst 200 MB)
+        if let oldURL = UndoStore.save(old) {
+            undoManager?.registerUndo(withTarget: self) { doc in
+                guard let o = UndoStore.load(oldURL) else { NSSound.beep(); return }
+                doc.replaceData(o, old: new, action: action)
+            }
+        } else {
+            undoManager?.registerUndo(withTarget: self) { $0.replaceData(old, old: new, action: action) }
+        }
         undoManager?.safeActionName(action)
         updateChangeCount(.changeDone)
         Log.w("replaceData \(action): \(new.count) Bytes, Seite \(idx)")

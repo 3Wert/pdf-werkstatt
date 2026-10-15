@@ -9,7 +9,7 @@ enum Tool: Int, CaseIterable {
     var title: String {
         switch self {
         case .textSelect: return "Textauswahl"
-        case .rectSelect: return "Rechteckige Auswahl"
+        case .rectSelect: return "Bereich auswählen"
         case .crop: return "Zuschneiden"
         case .draw: return "Zeichnen"
         case .sketch: return "Skizzieren (Formen werden erkannt)"
@@ -65,8 +65,9 @@ final class Canvas: PDFView, NSTextViewDelegate {
         didSet {
             endEditing()
             if tool != .rectSelect && tool != .crop { marquee = nil }
-            if tool != .editText { contentSel = nil }
+            if tool != .editText && tool != .rectSelect { contentSel = nil }
             updateCropBar()
+            prewarmContent()
             onToolChange?(tool)
             applyToolToExistingSelection()
         }
@@ -88,65 +89,167 @@ final class Canvas: PDFView, NSTextViewDelegate {
 
     // MARK: Direkter Eingriff in den Seiteninhalt
 
-    /// Ausgewähltes Inhaltselement (Textstück, Pfad, Bild) im Werkzeug „Text im PDF bearbeiten“
-    struct ContentSelection { var pageIndex: Int; var model: PageContentModel; var data: Data; var index: Int; var element: ContentElement { model.elements[index] } }
+    /// Ausgewählte Inhaltselemente einer Seite (Textstücke, Pfade, Bilder)
+    struct ContentSelection {
+        var pageIndex: Int
+        var model: PageContentModel
+        var indices: [Int]
+        var element: ContentElement { model.elements[indices[0]] }
+        var bounds: CGRect { indices.reduce(CGRect.null) { $0.union(model.elements[$1].bounds) } }
+        var canMove: Bool { indices.allSatisfy { model.elements[$0].canMove } }
+    }
     private(set) var contentSel: ContentSelection? { didSet { overlay.needsDisplay = true; onSelectionChange?(selected) } }
     private var contentDragOffset: CGVector = .zero
     private var contentUnsupportedShown = false
+    /// Inhaltsmodelle je Seite – bleiben gültig, solange sich der Seiteninhalt nicht ändert (Prüfsumme)
+    private var contentCache: [Int: PageContentModel] = [:]
+    private var prewarming = Set<Int>()
 
     func clearContentSelection() { contentSel = nil }
 
-    /// Frisches Inhaltsmodell einer Seite (immer vom aktuellen Stand, damit keine Anmerkung verloren geht)
-    func contentModel(for page: PDFPage) -> (PageContentModel, Data)? {
+    private func contentUnsupported() {
+        guard !contentUnsupportedShown, let w = window else { return }
+        contentUnsupportedShown = true
+        let a = NSAlert()
+        a.messageText = "Direktes Bearbeiten für diese Datei nicht möglich"
+        a.informativeText = "Der Seiteninhalt lässt sich nicht lesen (z. B. verschlüsselt oder ungewöhnlich kodiert). Text wird stattdessen abgedeckt und neu gesetzt."
+        a.beginSheetModal(for: w)
+    }
+
+    /// Inhaltsmodell einer Seite – aus dem Zwischenspeicher, wenn der Inhalt unverändert ist
+    func contentModel(for page: PDFPage) -> PageContentModel? {
         guard let d = document, let data = wdoc?.currentData() else { return nil }
         let idx = d.index(for: page)
-        guard let m = PageContentModel(data: data, pageIndex: idx) else {
-            if !contentUnsupportedShown, let w = window {
-                contentUnsupportedShown = true
-                let a = NSAlert()
-                a.messageText = "Direktes Bearbeiten für diese Datei nicht möglich"
-                a.informativeText = "Der Seiteninhalt lässt sich nicht lesen (z. B. verschlüsselt oder ungewöhnlich kodiert). Text wird stattdessen abgedeckt und neu gesetzt."
-                a.beginSheetModal(for: w)
+        let t0 = Date()
+        guard let f = try? PDFFile(data: data), let m = PageContentModel.load(file: f, pageIndex: idx, reuse: contentCache[idx]) else { contentUnsupported(); return nil }
+        if contentCache[idx] !== m { Log.v("Seite \(idx + 1) vermessen: \(m.elements.count) Elemente, \(Int(Date().timeIntervalSince(t0) * 1000)) ms") }
+        contentCache[idx] = m
+        return m
+    }
+
+    /// Aktuelle Seite schon im Hintergrund vermessen, damit der erste Klick sofort reagiert
+    func prewarmContent() {
+        guard tool == .editText || tool == .rectSelect, let d = document, let page = currentPage, let data = wdoc?.currentData() else { return }
+        let idx = d.index(for: page)
+        guard !prewarming.contains(idx) else { return }
+        prewarming.insert(idx)
+        let reuse = contentCache[idx]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let m = (try? PDFFile(data: data)).flatMap { PageContentModel.load(file: $0, pageIndex: idx, reuse: reuse) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.prewarming.remove(idx)
+                if let m { self.contentCache[idx] = m }
             }
-            return nil
         }
-        return (m, data)
+    }
+
+    private func applyContent(_ m: PageContentModel, _ edits: [ContentStream.Edit], action: String) -> Bool {
+        guard let fresh = wdoc?.currentData(), let out = m.apply(edits, to: fresh) else {
+            NSSound.beep(); Log.w("Inhalt ändern fehlgeschlagen (\(action))"); return false
+        }
+        wdoc?.replaceData(out, old: fresh, action: action)
+        return true
     }
 
     func selectContent(at pp: CGPoint, on page: PDFPage) -> Bool {
-        guard let (m, data) = contentModel(for: page), let k = m.element(at: pp), let d = document else { contentSel = nil; return false }
-        contentSel = ContentSelection(pageIndex: d.index(for: page), model: m, data: data, index: k)
+        guard let m = contentModel(for: page), let k = m.element(at: pp), let d = document else { contentSel = nil; return false }
         select(nil)
+        contentSel = ContentSelection(pageIndex: d.index(for: page), model: m, indices: [k])
         return true
+    }
+
+    /// Bereich bearbeiten: alle Inhaltselemente und eigenen Objekte im Rahmen auswählen
+    func selectContent(in r: CGRect, on page: PDFPage) {
+        guard let d = document else { return }
+        let objs = objects(in: convert(r, from: page)).filter { $0.page === page }
+        if let m = contentModel(for: page) {
+            let ks = m.elements(in: r, share: 0.5)
+            contentSel = ks.isEmpty ? nil : ContentSelection(pageIndex: d.index(for: page), model: m, indices: ks)
+        }
+        select(all: objs)
     }
 
     func removeContentSelection() {
-        guard let cs = contentSel, let out = cs.model.apply([.remove(cs.index)]) else { NSSound.beep(); return }
+        let objs = selectedObjects
+        guard contentSel != nil || !objs.isEmpty else { return }
+        let cs = contentSel
+        um?.beginUndoGrouping()
+        for a in objs { if let p = a.page { remove(a, from: p) } }
         contentSel = nil
-        wdoc?.replaceData(out, old: cs.data, action: "Inhalt löschen")
+        if let cs { _ = applyContent(cs.model, cs.indices.map { .remove($0) }, action: "Inhalt löschen") }
+        um?.safeActionName("Inhalt löschen")
+        um?.endUndoGrouping()
+        if tool == .rectSelect { marquee = nil }
     }
 
+    /// Verschiebt ausgewählten Inhalt und ausgewählte eigene Objekte gemeinsam (Seitenkoordinaten)
     func moveContentSelection(dx: CGFloat, dy: CGFloat) {
-        guard let cs = contentSel, cs.element.canMove, let out = cs.model.apply([.move(cs.index, dx, dy)]) else { NSSound.beep(); return }
-        let idx = cs.pageIndex
-        let newBounds = cs.element.bounds.offsetBy(dx: dx, dy: dy)
+        let cs = contentSel
+        if let cs, !cs.canMove { NSSound.beep(); return }
+        let ids = selectedObjects.map { ident($0) }
+        let objPage = selectedObjects.first?.page.flatMap { document?.index(for: $0) } ?? 0
+        um?.beginUndoGrouping()
+        for a in selectedObjects where canMove(a) { setBounds(a, a.bounds.offsetBy(dx: dx, dy: dy), action: "Bewegen") }
         contentSel = nil
-        wdoc?.replaceData(out, old: cs.data, action: "Inhalt verschieben")
-        // Auswahl auf dem neuen Stand wiederfinden
-        if let d = document, let p = d.page(at: idx), let (m, data) = contentModel(for: p),
-           let k = m.element(at: CGPoint(x: newBounds.midX, y: newBounds.midY)) {
-            contentSel = ContentSelection(pageIndex: idx, model: m, data: data, index: k)
+        var ok = true
+        if let cs { ok = applyContent(cs.model, cs.indices.map { .move($0, dx, dy) }, action: "Inhalt verschieben") }
+        um?.safeActionName("Inhalt verschieben")
+        um?.endUndoGrouping()
+        if let (p, r) = marquee { marquee = (locatePage(p, index: cs?.pageIndex ?? objPage) ?? p, r.offsetBy(dx: dx, dy: dy)) }
+        // Auswahl auf dem neuen Stand wiederherstellen
+        guard let d = document else { return }
+        if let cs, ok, let p = d.page(at: cs.pageIndex), let m = contentModel(for: p) {
+            let ks = m.elements.count == cs.model.elements.count ? cs.indices
+                : cs.indices.compactMap { k in let b = cs.model.elements[k].bounds.offsetBy(dx: dx, dy: dy); return m.element(at: CGPoint(x: b.midX, y: b.midY)) }
+            contentSel = ks.isEmpty ? nil : ContentSelection(pageIndex: cs.pageIndex, model: m, indices: ks)
         }
+        let objs = ids.compactMap { id -> PDFAnnotation? in
+            for i in 0..<d.pageCount { if let f = d.page(at: i)?.annotations.first(where: { ident($0) == id }) { return f } }
+            return nil
+        }
+        select(all: objs)
     }
 
-    /// Entfernt Inhaltselemente (nur Text), die überwiegend in den Rechtecken liegen. Liefert true, wenn etwas entfernt wurde.
+    /// Entfernt Text-Inhalt, der überwiegend in den Rechtecken liegt. Gruppen werden bei Bedarf vorher aufgelöst.
     private func removeTextContent(in rects: [CGRect], on page: PDFPage) -> Bool {
-        guard let (m, data) = contentModel(for: page) else { return false }
+        guard let d = document else { return false }
+        let idx = d.index(for: page)
+        guard var m = contentModel(for: page) else { return false }
         var ks = Set<Int>()
         for r in rects { for k in m.elements(in: r.insetBy(dx: -1, dy: -1)) where m.elements[k].kind == .text { ks.insert(k) } }
-        guard !ks.isEmpty, let out = m.apply(ks.map { .remove($0) }) else { return false }
-        wdoc?.replaceData(out, old: data, action: "Text bearbeiten")
-        return true
+        if ks.isEmpty {
+            let union = rects.reduce(CGRect.null) { $0.union($1) }
+            let forms = m.elements.indices.filter { m.elements[$0].kind == .form && m.elements[$0].bounds.intersects(union) }
+            guard !forms.isEmpty, applyContent(m, forms.map { .dissolve($0) }, action: "Gruppe auflösen"),
+                  let np = document?.page(at: idx), let nm = contentModel(for: np) else { return false }
+            m = nm
+            for r in rects { for k in m.elements(in: r.insetBy(dx: -1, dy: -1)) where m.elements[k].kind == .text { ks.insert(k) } }
+        }
+        guard !ks.isEmpty else { return false }
+        return applyContent(m, ks.map { .remove($0) }, action: "Text bearbeiten")
+    }
+
+    /// Vor dem Versenden: Inhalt unter Abdeckungen/Schwärzungen wirklich entfernen.
+    /// Liefert (entfernt, nur teilweise abgedeckt).
+    func removeContentUnderCovers() -> (Int, Int) {
+        guard let d = document else { return (0, 0) }
+        let covers = SendCheck.covers(d)
+        var removed = 0, partial = 0
+        um?.beginUndoGrouping()
+        for pageIdx in Set(covers.map { $0.0 }).sorted() {
+            guard let page = document?.page(at: pageIdx), let m = contentModel(for: page) else { continue }
+            let rects = covers.filter { $0.0 == pageIdx }.map { $0.1.insetBy(dx: -0.5, dy: -0.5) }
+            var ks: [Int] = []
+            for k in m.elements.indices {
+                let c = rects.map { m.coverage(k, by: $0) }.max() ?? 0
+                if c >= 0.6 { ks.append(k) } else if c > 0.05 { partial += 1 }
+            }
+            if !ks.isEmpty, applyContent(m, ks.map { .remove($0) }, action: "Inhalt unter Abdeckung entfernen") { removed += ks.count }
+        }
+        um?.safeActionName("Inhalt unter Abdeckung entfernen")
+        um?.endUndoGrouping()
+        return (removed, partial)
     }
     private var loupePoint: CGPoint?
 
@@ -220,6 +323,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
         displaysPageBreaks = true
         registerForDraggedTypes([.fileURL])
         NotificationCenter.default.addObserver(self, selector: #selector(scaleChanged), name: .PDFViewScaleChanged, object: self)
+        NotificationCenter.default.addObserver(self, selector: #selector(pageDidChange), name: .PDFViewPageChanged, object: self)
     }
     required init?(coder: NSCoder) { nil }
 
@@ -261,6 +365,8 @@ final class Canvas: PDFView, NSTextViewDelegate {
         }
         bringOverlayToFront(); observeScrolling()
     }
+
+    @objc private func pageDidChange() { prewarmContent() }
 
     @objc private func scrolled() { positionEditor(); positionCropBar(); overlay.needsDisplay = true }
     @objc private func scaleChanged() { styleEditor(); positionCropBar(); overlay.needsDisplay = true }
@@ -452,6 +558,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
     }
 
     func refresh(_ a: PDFAnnotation?) {
+        wdoc?.touch()
         overlay.needsDisplay = true
         guard let a, let p = a.page else { return }
         annotationsChanged(on: p)
@@ -461,7 +568,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
 
     func add(_ a: PDFAnnotation, to p: PDFPage, action: String? = nil) {
         a.shouldDisplay = true
-        Log.w("add \(action ?? "") \((a as? WObject)?.model.kind.rawValue ?? (a.type ?? "?")) pageDoc=\(p.document === document) idx=\(document?.index(for: p) ?? -1)")
+        Log.v("add \(action ?? "") \((a as? WObject)?.model.kind.rawValue ?? (a.type ?? "?")) pageDoc=\(p.document === document) idx=\(document?.index(for: p) ?? -1)")
         _ = ident(a)
         p.addAnnotation(a)
         refresh(a)
@@ -472,11 +579,12 @@ final class Canvas: PDFView, NSTextViewDelegate {
     }
 
     func remove(_ a: PDFAnnotation, from p: PDFPage, action: String? = nil) {
-        Log.w("remove \(action ?? "") vorher: [\(Log.describe(p))]")
-        defer { Log.w("remove nachher: [\(Log.describe(p))] docIndex=\(document?.index(for: p) ?? -1) pageDoc=\(p.document === document)") }
+        Log.v("remove \(action ?? "") vorher: [\(Log.describe(p))]")
+        defer { Log.v("remove nachher: [\(Log.describe(p))] docIndex=\(document?.index(for: p) ?? -1) pageDoc=\(p.document === document)") }
         if isSelected(a) { selectedObjects.removeAll { $0 === a } }
         if editObj === a { endEditing() }
         // Bereich merken, bevor das Objekt weg ist – danach kennt PDFKit die Stelle nicht mehr
+        wdoc?.touch()
         let dirty = convert(a.bounds.insetBy(dx: -12, dy: -12), from: p)
         // 1. erst unsichtbar machen – so bekommt PDFKit die Änderung noch mit, solange das Objekt existiert
         a.shouldDisplay = false
@@ -533,6 +641,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
 
     func setOrder(_ order: [PDFAnnotation], on p: PDFPage) {
         let old = p.annotations.filter { $0.type != "Widget" }
+        wdoc?.touch()
         old.forEach { p.removeAnnotation($0) }
         order.forEach { p.addAnnotation($0) }
         annotationsChanged(on: p)
@@ -608,7 +717,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
 
     private func handleMouseDown(_ e: NSEvent) {
         if let pg = page(for: viewPoint(e), nearest: false) {
-            Log.w("mouseDown tool=\(tool) hit=\(String(describing: objectAt(viewPoint(e)).map { ($0.0 as? WObject)?.model.kind.rawValue ?? $0.0.type ?? "?" })) page=[\(Log.describe(pg))]")
+            Log.v("mouseDown tool=\(tool) hit=\(String(describing: objectAt(viewPoint(e)).map { ($0.0 as? WObject)?.model.kind.rawValue ?? $0.0.type ?? "?" })) page=[\(Log.describe(pg))]")
         }
         if let tv = editor, tv.frame.contains(viewPoint(e)) {
             window?.makeFirstResponder(tv)
@@ -668,8 +777,8 @@ final class Canvas: PDFView, NSTextViewDelegate {
             }
             // Einfacher Klick: Inhaltselement auswählen, Ziehen verschiebt es
             if selectContent(at: pp, on: page), let cs = contentSel {
-                drag = DragState(mode: .contentMove, page: page, startView: vp, startRect: convert(cs.element.bounds, from: page),
-                                 startBounds: cs.element.bounds, startModel: nil, obj: nil)
+                drag = DragState(mode: .contentMove, page: page, startView: vp, startRect: convert(cs.bounds, from: page),
+                                 startBounds: cs.bounds, startModel: nil, obj: nil)
                 contentDragOffset = .zero
                 return
             }
@@ -686,7 +795,13 @@ final class Canvas: PDFView, NSTextViewDelegate {
             trackTextSelection(e, page: page, pp: pp, vp: vp)
 
         case .rectSelect:
+            if let (mp, mr) = marquee, mp === page, mr.contains(pp), contentSel != nil || !selectedObjects.isEmpty {
+                drag = DragState(mode: .contentMove, page: page, startView: vp, startRect: convert(mr, from: page), startBounds: mr, startModel: nil, obj: nil)
+                contentDragOffset = .zero
+                return
+            }
             select(nil)
+            contentSel = nil
             marquee = nil
             drag = DragState(mode: .marquee, page: page, startView: vp, startRect: .zero, startBounds: .zero, startModel: nil, obj: nil)
 
@@ -780,6 +895,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
     }
 
     func setCrop(_ page: PDFPage, _ r: CGRect) {
+        wdoc?.touch()
         let old = page.bounds(for: .cropBox)
         page.setBounds(r, for: .cropBox)
         um?.registerUndo(withTarget: self) { $0.setCrop(page, old) }
@@ -902,7 +1018,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             let r = resized(d.startRect, handle: h, dx: dx, dy: dy, keepAspect: shift)
             marquee = (d.page, convert(r, to: d.page).intersection(d.page.bounds(for: .mediaBox)))
         case .contentMove:
-            guard contentSel?.element.canMove == true else { break }
+            guard contentSel?.canMove ?? true else { break }
             var ddx = dx, ddy = dy
             if shift { if abs(dx) > abs(dy) { ddy = 0 } else { ddx = 0 } }
             let p0 = convert(d.startView, to: d.page), p1 = convert(CGPoint(x: d.startView.x + ddx, y: d.startView.y + ddy), to: d.page)
@@ -960,6 +1076,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             select(w)
         case .marquee:
             if !d.moved { marquee = nil }
+            if tool == .rectSelect, let (p, r) = marquee { selectContent(in: r, on: p) }
             updateCropBar()
         case .marqueeResize:
             updateCropBar()
@@ -1156,9 +1273,20 @@ final class Canvas: PDFView, NSTextViewDelegate {
         let tw = WObject(model: m, bounds: .zero)
         let f = tw.textFont
         let top: CGFloat = m.lineHeight.map { rects[0].minY + $0 + pad } ?? (rects[0].minY - f.descender + f.ascender + pad)
-        tw.bounds = CGRect(x: union.minX - pad, y: top - 10, width: union.width + 2 * pad + 2, height: 10)
-        tw.fitBounds()
-        if !m.autoWidth { tw.bounds.size.width = max(tw.bounds.width, union.width + 2 * pad + 2) }
+        let rot = PDFTools.normRotation(page.rotation)
+        if rot == 0 {
+            tw.bounds = CGRect(x: union.minX - pad, y: top - 10, width: union.width + 2 * pad + 2, height: 10)
+            tw.fitBounds()
+            if !m.autoWidth { tw.bounds.size.width = max(tw.bounds.width, union.width + 2 * pad + 2) }
+        } else {
+            // gedrehte Seite: Text aufrecht wie auf dem Bildschirm, obere linke Ecke der Zeile (sichtbar) bleibt stehen
+            var mm = tw.model; mm.rot = rot; tw.model = mm
+            let swapped = rot == 90 || rot == 270
+            let visW = (swapped ? union.height : union.width) + 2 * pad + 2
+            tw.bounds = union.insetBy(dx: -pad, dy: -pad)
+            if !mm.autoWidth { tw.bounds = WObject.anchoredRect(old: tw.bounds, w: visW, h: 10, rotation: rot) }
+            tw.fitBounds()
+        }
 
         um?.beginUndoGrouping()
         let pageIdx = document?.index(for: page) ?? 0
@@ -1307,13 +1435,16 @@ final class Canvas: PDFView, NSTextViewDelegate {
     /// Tastatur für Objekte. Läuft zusätzlich über einen Fenster-Monitor, weil PDFKit Tasten selbst schluckt.
     @discardableResult
     func handleKey(_ e: NSEvent) -> Bool {
-        Log.w("key \(e.keyCode) fr=\(String(describing: window?.firstResponder.map { type(of: $0) })) sel=\((selected as? WObject)?.model.kind.rawValue ?? selected?.type ?? "nil") selPage=\(selected?.page != nil)")
+        Log.v("key \(e.keyCode) fr=\(String(describing: window?.firstResponder.map { type(of: $0) })) sel=\((selected as? WObject)?.model.kind.rawValue ?? selected?.type ?? "nil") selPage=\(selected?.page != nil)")
         let flags = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if tool == .rectSelect, contentSel != nil || (!selectedObjects.isEmpty && marquee != nil), [51, 117].contains(e.keyCode) {
+            removeContentSelection(); return true
+        }
         if let cs = contentSel {
             switch e.keyCode {
             case 51, 117: removeContentSelection(); return true
             case 123, 124, 125, 126:
-                guard cs.element.canMove else { NSSound.beep(); return true }
+                guard cs.canMove else { NSSound.beep(); return true }
                 let st: CGFloat = flags.contains(.shift) ? 10 : 1
                 let v = e.keyCode == 123 ? CGVector(dx: -st, dy: 0) : e.keyCode == 124 ? CGVector(dx: st, dy: 0) : e.keyCode == 126 ? CGVector(dx: 0, dy: st) : CGVector(dx: 0, dy: -st)
                 moveContentSelection(dx: v.dx, dy: v.dy); return true
@@ -1819,15 +1950,28 @@ final class Canvas: PDFView, NSTextViewDelegate {
             guard let p = d.page(at: i) else { continue }
             let pr = convert(p.bounds(for: .cropBox), from: p)
             guard pr.intersects(visible) else { continue }
-            let ws = p.annotations.compactMap { $0 as? WObject }.filter { !$0.editing && $0.shouldDisplay }
-            if ws.isEmpty { continue }
+            let anns = p.annotations
+            if !anns.contains(where: { $0 is WObject }) { continue }
             // Abbildung Seite → Ansicht (Zoom, Drehung, Lage) aus drei Punkten
             let o = convert(CGPoint.zero, from: p), x = convert(CGPoint(x: 1, y: 0), from: p), y = convert(CGPoint(x: 0, y: 1), from: p)
             let t = CGAffineTransform(a: x.x - o.x, b: x.y - o.y, c: y.x - o.x, d: y.y - o.y, tx: o.x, ty: o.y)
             ctx.saveGState()
             ctx.clip(to: pr)
             ctx.concatenate(t)
-            DrawMode.full { for w in ws { w.draw(with: .cropBox, in: ctx) } }
+            // In Datei-Reihenfolge: eigene Objekte zeichnen; fremde Anmerkungen (Hervorhebungen), die in der Datei darüber
+            // liegen, dort nachzeichnen, wo ein deckendes eigenes Objekt sie sonst verbergen würde
+            var opaque: [CGRect] = []
+            for a in anns {
+                if let w = a as? WObject {
+                    guard !w.editing, w.shouldDisplay else { continue }
+                    DrawMode.full { w.draw(with: .cropBox, in: ctx) }
+                    if w.model.fill != nil || w.model.kind == .image || w.model.kind == .cover { opaque.append(w.bounds) }
+                } else if !opaque.isEmpty, a.shouldDisplay, !["Widget", "Link", "Popup"].contains(a.type ?? "") {
+                    let hits = opaque.compactMap { r -> CGRect? in let i = r.intersection(a.bounds); return (i.isNull || i.isEmpty) ? nil : i }
+                    guard !hits.isEmpty else { continue }
+                    ctx.saveGState(); ctx.clip(to: hits); a.draw(with: .cropBox, in: ctx); ctx.restoreGState()
+                }
+            }
             ctx.restoreGState()
         }
     }
@@ -1879,12 +2023,16 @@ final class Canvas: PDFView, NSTextViewDelegate {
             NSColor.controlAccentColor.setStroke(); p.stroke()
         }
         if let cs = contentSel, let d = document, let p = d.page(at: cs.pageIndex) {
-            let b = cs.element.bounds
+            let b = cs.bounds
             let vr = convert(b, from: p)
             let col = NSColor(srgbRed: 0.85, green: 0.45, blue: 0.05, alpha: 1)
+            if cs.indices.count > 1 {
+                col.withAlphaComponent(0.6).setStroke()
+                for k in cs.indices { let r = NSBezierPath(rect: convert(cs.model.elements[k].bounds, from: p)); r.lineWidth = 0.5; r.stroke() }
+            }
             col.setStroke()
             let f = NSBezierPath(rect: vr.insetBy(dx: -1, dy: -1)); f.lineWidth = 1.5
-            if !cs.element.canMove { f.setLineDash([2, 3], count: 2, phase: 0) }
+            if !cs.canMove { f.setLineDash([2, 3], count: 2, phase: 0) }
             f.stroke()
             if contentDragOffset != .zero {
                 let gv = convert(b.offsetBy(dx: contentDragOffset.dx, dy: contentDragOffset.dy), from: p)
@@ -1892,8 +2040,9 @@ final class Canvas: PDFView, NSTextViewDelegate {
                 let g = NSBezierPath(rect: gv); g.lineWidth = 1; g.setLineDash([4, 3], count: 2, phase: 0); g.stroke()
             }
             // Beschriftung
-            let kind = ["text": "Text", "path": "Pfad", "image": "Bild", "form": "Gruppe", "inlineImage": "Bild", "shading": "Verlauf"][cs.element.kind.rawValue] ?? ""
-            let txt = (kind + (cs.element.canMove ? " – Ziehen verschiebt, ⌫ löscht" : " – ⌫ löscht (nicht verschiebbar)")) as NSString
+            let kind = cs.indices.count > 1 ? "\(cs.indices.count) Elemente"
+                : (["text": "Text", "path": "Pfad", "image": "Bild", "form": "Gruppe", "inlineImage": "Bild", "shading": "Verlauf"][cs.element.kind.rawValue] ?? "")
+            let txt = (kind + (cs.canMove ? " – Ziehen verschiebt, ⌫ löscht" : " – ⌫ löscht (nicht alles verschiebbar)")) as NSString
             let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.white]
             let sz = txt.size(withAttributes: attrs)
             let y = isFlipped ? vr.minY - sz.height - 8 : vr.maxY + 6

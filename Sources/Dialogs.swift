@@ -191,7 +191,15 @@ enum Dialogs {
             guard r == .OK, let url = panel.url else { return }
             let pw = acc.password.stringValue
             let pdf = doc.pdf!
-            switch acc.format.indexOfSelectedItem {
+            var format = acc.format.indexOfSelectedItem
+            if format <= 2 {
+                switch SendCheck.run(doc: doc, window: window, verb: "Exportieren") {
+                case .cancel: return
+                case .rasterize: format = 3
+                case .proceed: break
+                }
+            }
+            switch format {
             case 0:
                 pdf.dataRepresentation(options: PDFTools.writeOptions(password: pw))
                     .map { try? $0.write(to: url) }
@@ -209,7 +217,7 @@ enum Dialogs {
                 let idx = doc.controller?.canvas.currentPage.map { pdf.index(for: $0) } ?? 0
                 guard let p = snap.page(at: idx), let img = PDFTools.render(p, dpi: acc.dpiValue) else { return }
                 let rep = NSBitmapImageRep(cgImage: img)
-                let jpeg = acc.format.indexOfSelectedItem == 5
+                let jpeg = format == 5
                 try? rep.representation(using: jpeg ? .jpeg : .png, properties: jpeg ? [.compressionFactor: 0.9] : [:])?.write(to: url)
             }
         }
