@@ -3,6 +3,11 @@ import PDFKit
 import ImageIO
 import UniformTypeIdentifiers
 
+extension CGRect {
+    /// Endlich, nicht leer im Sinne von „null“ – sicher zum Zeichnen (NSBezierPath wirft sonst eine Ausnahme)
+    var isUsable: Bool { !isNull && !isInfinite && origin.x.isFinite && origin.y.isFinite && size.width.isFinite && size.height.isFinite }
+}
+
 extension String {
     var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
 }

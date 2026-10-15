@@ -96,6 +96,10 @@ final class Canvas: PDFView, NSTextViewDelegate {
         var indices: [Int]
         var element: ContentElement { model.elements[indices[0]] }
         var bounds: CGRect { indices.reduce(CGRect.null) { $0.union(model.elements[$1].bounds) } }
+        /// nur Elemente mit gültiger Größe (nicht vermessene oder neben die Seite verschobene fallen raus)
+        static func valid(_ ks: [Int], in m: PageContentModel) -> [Int] {
+            ks.filter { $0 >= 0 && $0 < m.elements.count && m.elements[$0].bounds.isUsable }
+        }
         var canMove: Bool { indices.allSatisfy { model.elements[$0].canMove } }
     }
     private(set) var contentSel: ContentSelection? { didSet { overlay.needsDisplay = true; onSelectionChange?(selected) } }
@@ -165,7 +169,8 @@ final class Canvas: PDFView, NSTextViewDelegate {
         let objs = objects(in: convert(r, from: page)).filter { $0.page === page }
         if let m = contentModel(for: page) {
             let ks = m.elements(in: r, share: 0.5)
-            contentSel = ks.isEmpty ? nil : ContentSelection(pageIndex: d.index(for: page), model: m, indices: ks)
+            let v = ContentSelection.valid(ks, in: m)
+            contentSel = v.isEmpty ? nil : ContentSelection(pageIndex: d.index(for: page), model: m, indices: v)
         }
         select(all: objs)
     }
@@ -202,7 +207,8 @@ final class Canvas: PDFView, NSTextViewDelegate {
         if let cs, ok, let p = d.page(at: cs.pageIndex), let m = contentModel(for: p) {
             let ks = m.elements.count == cs.model.elements.count ? cs.indices
                 : cs.indices.compactMap { k in let b = cs.model.elements[k].bounds.offsetBy(dx: dx, dy: dy); return m.element(at: CGPoint(x: b.midX, y: b.midY)) }
-            contentSel = ks.isEmpty ? nil : ContentSelection(pageIndex: cs.pageIndex, model: m, indices: ks)
+            let v = ContentSelection.valid(ks, in: m)
+            contentSel = v.isEmpty ? nil : ContentSelection(pageIndex: cs.pageIndex, model: m, indices: v)
         }
         let objs = ids.compactMap { id -> PDFAnnotation? in
             for i in 0..<d.pageCount { if let f = d.page(at: i)?.annotations.first(where: { ident($0) == id }) { return f } }
@@ -1993,7 +1999,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             p.lineCapStyle = .round; p.lineJoinStyle = .round
             p.stroke()
         }
-        if tool == .crop, let (page, r) = marquee {
+        if tool == .crop, let (page, r) = marquee, r.isUsable {
             let vr = convert(r, from: page)
             let pr = convert(page.bounds(for: .cropBox), from: page)
             let dim = NSBezierPath(rect: pr)
@@ -2008,7 +2014,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
                 NSColor.white.setFill(); hr.fill()
                 let b = NSBezierPath(rect: hr); b.lineWidth = 1; NSColor.black.withAlphaComponent(0.6).setStroke(); b.stroke()
             } }
-        } else if let (page, r) = marquee {
+        } else if let (page, r) = marquee, r.isUsable {
             let vr = convert(r, from: page)
             NSColor.black.withAlphaComponent(0.06).setFill(); vr.fill()
             let p = NSBezierPath(rect: vr.insetBy(dx: 0.5, dy: 0.5))
@@ -2017,24 +2023,24 @@ final class Canvas: PDFView, NSTextViewDelegate {
             p.setLineDash([4, 3], count: 2, phase: 3.5)
             NSColor.black.setStroke(); p.stroke()
         }
-        if let om = objectMarquee {
+        if let om = objectMarquee, om.isUsable {
             NSColor.controlAccentColor.withAlphaComponent(0.08).setFill(); om.fill()
             let p = NSBezierPath(rect: om.insetBy(dx: 0.5, dy: 0.5)); p.lineWidth = 1
             NSColor.controlAccentColor.setStroke(); p.stroke()
         }
-        if let cs = contentSel, let d = document, let p = d.page(at: cs.pageIndex) {
+        if let cs = contentSel, let d = document, let p = d.page(at: cs.pageIndex), cs.bounds.isUsable {
             let b = cs.bounds
             let vr = convert(b, from: p)
             let col = NSColor(srgbRed: 0.85, green: 0.45, blue: 0.05, alpha: 1)
             if cs.indices.count > 1 {
                 col.withAlphaComponent(0.6).setStroke()
-                for k in cs.indices { let r = NSBezierPath(rect: convert(cs.model.elements[k].bounds, from: p)); r.lineWidth = 0.5; r.stroke() }
+                for k in cs.indices where cs.model.elements[k].bounds.isUsable { let r = NSBezierPath(rect: convert(cs.model.elements[k].bounds, from: p)); r.lineWidth = 0.5; r.stroke() }
             }
             col.setStroke()
             let f = NSBezierPath(rect: vr.insetBy(dx: -1, dy: -1)); f.lineWidth = 1.5
             if !cs.canMove { f.setLineDash([2, 3], count: 2, phase: 0) }
             f.stroke()
-            if contentDragOffset != .zero {
+            if contentDragOffset != .zero, contentDragOffset.dx.isFinite, contentDragOffset.dy.isFinite {
                 let gv = convert(b.offsetBy(dx: contentDragOffset.dx, dy: contentDragOffset.dy), from: p)
                 col.withAlphaComponent(0.15).setFill(); gv.fill()
                 let g = NSBezierPath(rect: gv); g.lineWidth = 1; g.setLineDash([4, 3], count: 2, phase: 0); g.stroke()
@@ -2047,7 +2053,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             let sz = txt.size(withAttributes: attrs)
             let y = isFlipped ? vr.minY - sz.height - 8 : vr.maxY + 6
             let box = CGRect(x: vr.minX, y: y, width: sz.width + 12, height: sz.height + 4)
-            col.setFill(); NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4).fill()
+            col.setFill(); if box.isUsable { NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4).fill() }
             txt.draw(at: CGPoint(x: box.minX + 6, y: box.minY + 2), withAttributes: attrs)
         }
         // Rahmen der weiteren ausgewählten Objekte
@@ -2057,7 +2063,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             accent.setStroke()
             let f = NSBezierPath(rect: rr); f.lineWidth = 1; f.stroke()
         }
-        guard let r = selRect else { return }
+        guard let r = selRect, r.isUsable else { return }
         accent.setStroke()
         let frame = NSBezierPath(rect: r.insetBy(dx: -0.5, dy: -0.5))
         frame.lineWidth = 1
@@ -2078,7 +2084,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             let y = flipped ? r.minY - sz.height - 8 : r.maxY + 6
             let box = CGRect(x: r.minX, y: y, width: sz.width + 12, height: sz.height + 4)
             NSColor(srgbRed: 0.85, green: 0.45, blue: 0.05, alpha: 0.95).setFill()
-            NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4).fill()
+            if box.isUsable { NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4).fill() }
             txt.draw(at: CGPoint(x: box.minX + 6, y: box.minY + 2), withAttributes: attrs)
         }
     }

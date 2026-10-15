@@ -146,108 +146,20 @@ enum SelfTest {
         w.makeKeyAndOrderFront(nil)
         let c = wc.canvas
         func page() -> PDFPage { doc.pdf.page(at: 0)! }
-        func text() -> String { (page().string ?? "").replacingOccurrences(of: "\n", with: " | ") }
         func lb(_ t: String) -> CGRect? { doc.pdf.findString(t, withOptions: []).first.map { $0.bounds(for: $0.pages.first!) } }
-        func winPt(_ pp: CGPoint) -> CGPoint { c.convert(c.convert(pp, from: page()), to: nil) }
-        func drag(_ a: CGPoint, _ b: CGPoint) {
-            for i in 1...5 { w.postEvent(mouse(.leftMouseDragged, w, CGPoint(x: a.x + (b.x - a.x) * CGFloat(i) / 5, y: a.y + (b.y - a.y) * CGFloat(i) / 5)), atStart: false) }
-            w.postEvent(mouse(.leftMouseUp, w, b), atStart: false); w.sendEvent(mouse(.leftMouseDown, w, a))
-        }
-        func screenColor(_ pp: CGPoint) -> String {
-            let rep = c.bitmapImageRepForCachingDisplay(in: c.bounds)!; c.cacheDisplay(in: c.bounds, to: rep)
-            let v = c.convert(pp, from: page())
-            let px = Int(v.x * CGFloat(rep.pixelsWide) / c.bounds.width), py = Int((c.isFlipped ? v.y : c.bounds.height - v.y) * CGFloat(rep.pixelsHigh) / c.bounds.height)
-            return rep.colorAt(x: px, y: py)?.usingColorSpace(.sRGB)?.hexString ?? "?"
-        }
-        var t0 = Date()
         run([
-            { c.go(to: PDFDestination(page: page(), at: CGPoint(x: 0, y: 820))) },
-            // 1. Zwischenspeicher der Bytes
-            { t0 = Date(); _ = doc.currentData(); let a = Date().timeIntervalSince(t0); t0 = Date(); _ = doc.currentData(); let b = Date().timeIntervalSince(t0)
-              note("currentData: 1. Aufruf \(Int(a * 1000)) ms, 2. Aufruf \(String(format: "%.2f", b * 1000)) ms (Zwischenspeicher)") },
-            // 2. Vorab-Vermessung beim Werkzeugwechsel
             { c.tool = .editText },
-            { t0 = Date()
-              let r = lb("Rechnungsdatum")!
+            { let r = lb("Rechnungsdatum")!
               _ = c.selectContent(at: CGPoint(x: r.midX, y: r.midY), on: page())
-              note("Klick nach Vorab-Vermessung: \(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000)) ms, ausgewählt: \(c.contentSel?.element.name ?? "nichts")"); c.clearContentSelection() },
-            // 3. Bereich auswählen: drei Brieftext-Zeilen
-            { c.tool = .rectSelect
-              let r1 = lb("Sehr geehrte")!, r3 = lb("Leistungszeitraum")!
-              let u = r1.union(r3).insetBy(dx: -6, dy: -4)
-              let x2 = u.maxX + 140
-              drag(winPt(CGPoint(x: u.minX, y: u.maxY)), winPt(CGPoint(x: x2, y: u.minY))) },
-            { note("Bereich: \(c.contentSel?.indices.count ?? 0) Elemente ausgewählt") },
-            { guard let (_, mr) = c.marquee else { note("FEHLER kein Rahmen"); return }
-              let before = lb("Sehr geehrte")!
-              drag(winPt(CGPoint(x: mr.midX, y: mr.midY)), winPt(CGPoint(x: mr.midX + 40, y: mr.midY - 60)))
-              let after = lb("Sehr geehrte") ?? .zero
-              note("Bereich verschoben: Δx \(Int(after.minX - before.minX)), Δy \(Int(after.minY - before.minY)) (erwartet 40/−60), noch ausgewählt: \(c.contentSel?.indices.count ?? 0)") },
-            { key(51, "\u{7f}", w) },
-            { note("Bereich ⌫: 'Sehr geehrte' noch da: \(text().contains("Sehr geehrte")), 'Leistungszeitraum' noch da: \(text().contains("Leistungszeitraum"))") },
-            { cmdZ(w) },
-            { cmdZ(w) },
-            { note("2× ⌘Z: Text zurück: \(text().contains("Sehr geehrte")), an alter Stelle: \(Int(lb("Sehr geehrte")?.minY ?? 0))") },
-            // 4. Abdecken → vor dem Versenden wirklich entfernen
-            { c.tool = .textSelect
-              let r = lb("Rechnungsdatum: 12.10.2025")!
-              var m = Defaults.newModel(.cover); m.fill = RGBA(.white)
-              c.add(WObject(model: m, bounds: r.insetBy(dx: -2, dy: -2)), to: page(), action: "Abdecken")
-              let g = lb("Gesamtbetrag")!
-              c.add(WObject(model: m, bounds: CGRect(x: g.minX, y: g.minY, width: g.width * 0.3, height: g.height)), to: page(), action: "Abdecken")
-              note("Abdeckungen: \(SendCheck.covers(doc.pdf).count), Text im PDF noch da: \(text().contains("Rechnungsdatum"))") },
-            { let (r, part) = c.removeContentUnderCovers()
-              note("Unter Abdeckung entfernt: \(r), teilweise: \(part); 'Rechnungsdatum' noch im PDF: \(text().contains("Rechnungsdatum")), 'Gesamtbetrag' noch da (nur teilweise abgedeckt): \(text().contains("Gesamtbetrag")), Abdeckungen erhalten: \(SendCheck.covers(doc.pdf).count)") },
-            // 5. Ebenen auf dem Bildschirm: rotes Rechteck, darüber Hervorhebung
-            { let r = lb("Sehr geehrte")!
-              var m = Defaults.newModel(.rect); m.fill = RGBA(NSColor(hex: "9FCFFF")); m.stroke = nil
-              c.add(WObject(model: m, bounds: r.insetBy(dx: -4, dy: -4)), to: page(), action: "Rechteck")
-              let ohne = screenColor(CGPoint(x: r.maxX - 3, y: r.midY))
-              let h = PDFAnnotation(bounds: r, forType: .highlight, withProperties: nil); h.color = NSColor(hex: "FFD60A").withAlphaComponent(0.6)
-              h.quadrilateralPoints = [NSValue(point: NSPoint(x: 0, y: r.height)), NSValue(point: NSPoint(x: r.width, y: r.height)), NSValue(point: .zero), NSValue(point: NSPoint(x: r.width, y: 0))]
-              c.add(h, to: page(), action: "Hervorheben")
-              let pt = CGPoint(x: r.maxX - 3, y: r.midY)
-              note("Bildschirm: Rechteck allein \(ohne), mit Hervorhebung darüber \(screenColor(pt)) (muss sich unterscheiden)") },
-            // 6. Gedrehte Seite
-            { doc.rotate([page()], by: 90) },
-            { c.tool = .editText
-              let r = lb("Leistungszeitraum")!
-              let ok = c.selectContent(at: CGPoint(x: r.midX, y: r.midY), on: page())
-              note("gedrehte Seite: Element gewählt: \(ok) (\(c.contentSel?.element.name ?? "-"))")
-              let b0 = r
-              c.moveContentSelection(dx: 0, dy: -30)
-              let b1 = lb("Leistungszeitraum") ?? .zero
-              note("gedrehte Seite verschoben: Δy \(Int(b1.minY - b0.minY)) (erwartet −30)") },
-            { if let sel = page().selectionForLine(at: CGPoint(x: (lb("Leistungszeitraum") ?? .zero).midX, y: (lb("Leistungszeitraum") ?? .zero).midY)) {
-                  c.clearContentSelection()
-                  c.convertToEditable(sel, page: page(), caretAt: nil)
-              }
-              let t = page().annotations.compactMap { $0 as? WObject }.first { $0.model.kind == .text && $0.model.text.contains("Leistungszeitraum") }
-              note("Text bearbeiten auf gedrehter Seite: Editor \(c.isEditingText), Drehung im Objekt \(t?.model.rot ?? -1), Original entfernt: \(!text().contains("Leistungszeitraum"))")
-              c.endEditing() },
-            // 7. Sicherheitskopie
-            { doc.writeRecovery()
-              let p = Recovery.pending()
-              note("Sicherheitskopie: \(p.count) Eintrag, Name '\(p.first?.1.name ?? "-")', Datei \(((try? FileManager.default.attributesOfItem(atPath: Recovery.dir.appendingPathComponent(doc.recoveryID + ".pdf").path))?[.size] as? Int ?? 0) / 1024) KB")
-              let undoFiles = (try? FileManager.default.contentsOfDirectory(atPath: UndoStore.dir.path))?.count ?? 0
-              note("Widerrufen-Stände auf der Platte: \(undoFiles) Dateien") },
-            // 8. Werkzeugleiste bei 1280 pt Breite (13-Zoll-MacBook)
-            { w.setContentSize(NSSize(width: 1280, height: 800)) },
-            { let all = w.toolbar?.items.map { $0.label } ?? []
-              let vis = Set((w.toolbar?.visibleItems ?? []).map { $0.label })
-              note("Werkzeugleiste bei 1280 pt: \(vis.count) von \(all.count) sichtbar; im »-Menü: \(all.filter { !vis.contains($0) && !$0.isEmpty })")
-              w.setContentSize(NSSize(width: 1500, height: 900)) },
-            { let all = w.toolbar?.items.map { $0.label } ?? []
-              let vis = Set((w.toolbar?.visibleItems ?? []).map { $0.label })
-              note("bei 1500 pt: im »-Menü: \(all.filter { !vis.contains($0) && !$0.isEmpty })") },
-        ]) {
-            if let img = PDFTools.render(PDFTools.snapshot(doc.pdf).page(at: 0)!, dpi: 60) {
-                try? NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: dir + "/ende.png"))
-            }
-            doc.close()
-            note("nach Schließen: Sicherheitskopien übrig: \(Recovery.pending().count)")
-            finish(dir)
-        }
+              c.moveContentSelection(dx: 2000, dy: -3000)          // weit neben die Seite
+              note("nach Verschieben neben die Seite: Auswahl \(c.contentSel == nil ? "leer (richtig)" : "\(c.contentSel!.indices.count)")")
+              c.overlay.display() },
+            { c.overlay.display(); note("Overlay gezeichnet ohne Absturz") },
+            { let r = lb("Gesamtbetrag")!
+              _ = c.selectContent(at: CGPoint(x: r.midX, y: r.midY), on: page())
+              for _ in 0..<5 { c.moveContentSelection(dx: 15, dy: 10); c.overlay.display() }
+              note("5× verschoben und gezeichnet: Auswahl \(c.contentSel?.indices.count ?? 0)") },
+        ]) { finish(dir) }
     }
 
     static func finish(_ dir: String) {

@@ -930,7 +930,7 @@ final class PageContentModel {
     func element(at p: CGPoint) -> Int? {
         var best: Int? = nil
         var bestArea = CGFloat.greatestFiniteMagnitude
-        for (k, e) in elements.enumerated() where !e.bounds.isNull && e.bounds.insetBy(dx: -2, dy: -2).contains(p) {
+        for (k, e) in elements.enumerated() where e.bounds.isUsable && e.bounds.insetBy(dx: -2, dy: -2).contains(p) {
             let a = e.bounds.width * e.bounds.height
             if a < bestArea { bestArea = a; best = k }
         }
