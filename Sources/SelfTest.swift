@@ -190,7 +190,7 @@ enum SelfTest {
             { note("2× ⌘Z: Text zurück: \(text().contains("Sehr geehrte")), an alter Stelle: \(Int(lb("Sehr geehrte")?.minY ?? 0))") },
             // 4. Abdecken → vor dem Versenden wirklich entfernen
             { c.tool = .textSelect
-              let r = lb("Rechnungsdatum")!
+              let r = lb("Rechnungsdatum: 12.10.2025")!
               var m = Defaults.newModel(.cover); m.fill = RGBA(.white)
               c.add(WObject(model: m, bounds: r.insetBy(dx: -2, dy: -2)), to: page(), action: "Abdecken")
               let g = lb("Gesamtbetrag")!
@@ -200,13 +200,14 @@ enum SelfTest {
               note("Unter Abdeckung entfernt: \(r), teilweise: \(part); 'Rechnungsdatum' noch im PDF: \(text().contains("Rechnungsdatum")), 'Gesamtbetrag' noch da (nur teilweise abgedeckt): \(text().contains("Gesamtbetrag")), Abdeckungen erhalten: \(SendCheck.covers(doc.pdf).count)") },
             // 5. Ebenen auf dem Bildschirm: rotes Rechteck, darüber Hervorhebung
             { let r = lb("Sehr geehrte")!
-              var m = Defaults.newModel(.rect); m.fill = RGBA(NSColor(hex: "FF0000")); m.stroke = nil
+              var m = Defaults.newModel(.rect); m.fill = RGBA(NSColor(hex: "9FCFFF")); m.stroke = nil
               c.add(WObject(model: m, bounds: r.insetBy(dx: -4, dy: -4)), to: page(), action: "Rechteck")
+              let ohne = screenColor(CGPoint(x: r.maxX - 3, y: r.midY))
               let h = PDFAnnotation(bounds: r, forType: .highlight, withProperties: nil); h.color = NSColor(hex: "FFD60A").withAlphaComponent(0.6)
               h.quadrilateralPoints = [NSValue(point: NSPoint(x: 0, y: r.height)), NSValue(point: NSPoint(x: r.width, y: r.height)), NSValue(point: .zero), NSValue(point: NSPoint(x: r.width, y: 0))]
               c.add(h, to: page(), action: "Hervorheben")
               let pt = CGPoint(x: r.maxX - 3, y: r.midY)
-              note("Bildschirm: Rechteck mit Hervorhebung darüber → \(screenColor(pt)) (FF0000 wäre falsch, Hervorhebung muss sichtbar sein)") },
+              note("Bildschirm: Rechteck allein \(ohne), mit Hervorhebung darüber \(screenColor(pt)) (muss sich unterscheiden)") },
             // 6. Gedrehte Seite
             { doc.rotate([page()], by: 90) },
             { c.tool = .editText

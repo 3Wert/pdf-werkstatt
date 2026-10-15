@@ -94,7 +94,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         w.contentViewController = split
         w.setContentSize(NSSize(width: 1320, height: 880))
 
-        let tb = NSToolbar(identifier: "PDFWerkstattToolbar4")
+        let tb = NSToolbar(identifier: "PDFWerkstattToolbar5")
         tb.delegate = self
         tb.displayMode = .iconOnly
         tb.allowsUserCustomization = true
@@ -185,7 +185,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     // MARK: Werkzeugleiste – eine Reihe, immer sichtbar
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarMenu, .sidebarTrackingSeparator, .modes, .space, .shapes, .signature, .insertGroup, .space,
+        [.sidebarMenu, .sidebarTrackingSeparator, .modes, .shapes, .signature, .insertGroup,
          .styleGroup, .flexibleSpace, .highlight, .rotate, .zoom, .share, .search]
     }
 
@@ -291,6 +291,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
             return button(id, "Textstil", "textformat", #selector(textStylePopover(_:)), tip: "Schrift, Größe, Textfarbe")
         case .highlight:
             let it = menuItem(id, "Hervorheben", "highlighter", menu: highlightMenu(), action: #selector(toggleHighlight(_:)))
+            it.visibilityPriority = .high
             highlightItem = it
             return it
         case .rotate:
@@ -325,6 +326,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
             it.searchField.action = #selector(searchEntered(_:))
             it.searchField.sendsWholeSearchString = true
             it.preferredWidthForSearchField = 160
+            it.visibilityPriority = .high
             searchItem = it
             return it
         default:
