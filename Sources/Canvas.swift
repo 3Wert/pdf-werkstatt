@@ -243,6 +243,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             var ks: [Int] = []
             for k in m.elements.indices {
                 let c = rects.map { m.coverage(k, by: $0) }.max() ?? 0
+                if c > 0.05 { Log.v("Abdeckung: Element \(k) '\(m.elements[k].name)' \(m.elements[k].bounds) Deckung \(String(format: "%.2f", c)) Abdeckungen \(rects)") }
                 if c >= 0.6 { ks.append(k) } else if c > 0.05 { partial += 1 }
             }
             if !ks.isEmpty, applyContent(m, ks.map { .remove($0) }, action: "Inhalt unter Abdeckung entfernen") { removed += ks.count }
