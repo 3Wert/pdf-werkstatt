@@ -2,6 +2,10 @@
 # Baut PDF-Werkstatt.app und installiert nach ~/Applications.
 set -e
 cd "$(dirname "$0")"
+# Vor jedem Bau den Stand festhalten (Sicherung landet über den post-commit-Haken in iCloud Drive)
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  git add -A && git commit -q -m "Automatischer Stand vor Build $(date '+%d.%m.%Y %H:%M')" && echo "Stand gesichert: $(git rev-parse --short HEAD)"
+fi
 NAME="PDF-Werkstatt"
 ZIEL="$HOME/Applications/$NAME.app"
 APP="$PWD/build/$NAME.app"
