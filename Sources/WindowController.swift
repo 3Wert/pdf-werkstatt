@@ -180,6 +180,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     }
 
     func windowWillClose(_ notification: Notification) { canvas.endEditing(); infoPanel?.close() }
+
+    /// Widerrufen aus jeder Ecke des Fensters (Seitenleiste, Suche …) landet bei der Arbeitsfläche
+    @objc func undo(_ s: Any?) { canvas.undo(s) }
+    @objc func redo(_ s: Any?) { canvas.redo(s) }
     func windowWillReturnUndoManager(_ window: NSWindow) -> UndoManager? { wdoc?.undoManager }
 
     // MARK: Werkzeugleiste – eine Reihe, immer sichtbar
