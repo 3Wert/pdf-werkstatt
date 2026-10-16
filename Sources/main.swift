@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.trim()
         Log.w("--- Start \(Bundle.main.infoDictionary?["CFBundleVersion"] ?? "") ---")
         UndoStore.purge()
+        Updater.start()
         SelfTest.runIfRequested()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             if ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil { Recovery.offerRestore() }
@@ -26,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showLog(_ s: Any?) { NSWorkspace.shared.open(Log.url) }
+    @objc func checkUpdates(_ s: Any?) { Updater.check(manual: true) }
     @objc func toggleVerboseLog(_ s: NSMenuItem) {
         prefs.set(!prefs.bool(forKey: "protokollAusfuehrlich"), forKey: "protokollAusfuehrlich")
     }
@@ -243,6 +245,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(view, "Vollbild", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
 
         let help = sub("Hilfe")
+        add(help, "Nach Updates suchen …", #selector(checkUpdates(_:)))
+        help.addItem(.separator())
         add(help, "Protokoll anzeigen", #selector(showLog(_:)))
         add(help, "Protokoll leeren", #selector(clearLog(_:)))
         add(help, "Protokoll ausführlich", #selector(toggleVerboseLog(_:)))

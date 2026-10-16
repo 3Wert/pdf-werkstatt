@@ -9,7 +9,7 @@ fi
 NAME="PDF-Werkstatt"
 ZIEL="$HOME/Applications/$NAME.app"
 APP="$PWD/build/$NAME.app"
-VERSION="1.0"
+VERSION="$(cat VERSION 2>/dev/null || echo 1.0)"
 BUILD=$(date +%Y%m%d%H%M)
 
 mkdir -p build
@@ -60,7 +60,22 @@ PL
 codesign --force -s - "$APP"
 rm -rf "$ZIEL"; mkdir -p "$HOME/Applications"; mv "$APP" "$ZIEL"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$ZIEL"
-# Fertige App als Zip in iCloud Drive (für andere Macs)
-ZIP="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Backups/PDFWerkstatt/PDF-Werkstatt.zip"
-mkdir -p "$(dirname "$ZIP")" && rm -f "$ZIP" && ditto -c -k --keepParent "$ZIEL" "$ZIP" && echo "Zip aktualisiert: $ZIP"
+# Fertige App als Zip in iCloud Drive + Update-Information (aktuell.json) für die Update-Prüfung
+OUT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Backups/PDFWerkstatt"
+mkdir -p "$OUT"
+ZIPNAME="PDF-Werkstatt-$VERSION-$BUILD.zip"
+ditto -c -k --keepParent "$ZIEL" "$OUT/$ZIPNAME"
+rm -f "$OUT/PDF-Werkstatt.zip"; cp "$OUT/$ZIPNAME" "$OUT/PDF-Werkstatt.zip"     # fester Name für Anleitungen
+ls -t "$OUT"/PDF-Werkstatt-*.zip | tail -n +4 | xargs rm -f 2>/dev/null || true   # nur die letzten drei behalten
+SHA=$(shasum -a 256 "$OUT/$ZIPNAME" | cut -d' ' -f1)
+# Änderungsliste: Zeilen unter der obersten Überschrift von CHANGES.md
+NOTES=$(awk '/^## /{n++; next} n==1 && /^- /{sub(/^- /,""); gsub(/"/,"\\\""); printf "%s\"%s\"", (c++?",":""), $0}' CHANGES.md 2>/dev/null)
+cat > "$OUT/aktuell.json" <<J
+{"version":"$VERSION","build":"$BUILD","date":"$(date '+%d.%m.%Y')","file":"$ZIPNAME","sha256":"$SHA","notes":[$NOTES]}
+J
+echo "Update bereitgestellt: $ZIPNAME ($VERSION, Build $BUILD)"
+# Optional auch auf den Webserver (für Kollegen ohne iCloud): PDFW_WEB=vps:/opt/3wert-neu/html/pdf-werkstatt ./build.sh
+if [ -n "$PDFW_WEB" ]; then
+  scp -q "$OUT/$ZIPNAME" "$OUT/aktuell.json" "$PDFW_WEB/" && echo "Auch hochgeladen nach $PDFW_WEB"
+fi
 echo "Installiert: $ZIEL"
