@@ -87,9 +87,11 @@ final class SnapSources {
             let sorted = baselines.sorted { $0.0 > $1.0 }
             for i in sorted.indices {
                 let (y, x0, x1) = sorted[i]
-                var gap: CGFloat? = nil
-                if i + 1 < sorted.count { gap = y - sorted[i + 1].0 } else if i > 0 { gap = sorted[i - 1].0 - y }
-                guard let g = gap, g > 2, g < 60 else { continue }
+                // kleinster plausibler Abstand zu einer Nachbarzeile (Absatzsprünge zählen nicht)
+                var gaps: [CGFloat] = []
+                if i + 1 < sorted.count { gaps.append(y - sorted[i + 1].0) }
+                if i > 0 { gaps.append(sorted[i - 1].0 - y) }
+                guard let g = gaps.filter({ $0 > 2 && $0 < 60 }).min() else { continue }
                 for cand in [y - g, y + g] where !sorted.contains(where: { abs($0.0 - cand) < 0.5 }) {
                     lines.append(SnapLine(kind: .lineSpacing, value: cand, vertical: false, range: x0...x1))
                 }
