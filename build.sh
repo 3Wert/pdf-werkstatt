@@ -60,4 +60,7 @@ PL
 codesign --force -s - "$APP"
 rm -rf "$ZIEL"; mkdir -p "$HOME/Applications"; mv "$APP" "$ZIEL"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$ZIEL"
+# Fertige App als Zip in iCloud Drive (für andere Macs)
+ZIP="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Backups/PDFWerkstatt/PDF-Werkstatt.zip"
+mkdir -p "$(dirname "$ZIP")" && rm -f "$ZIP" && ditto -c -k --keepParent "$ZIEL" "$ZIP" && echo "Zip aktualisiert: $ZIP"
 echo "Installiert: $ZIEL"

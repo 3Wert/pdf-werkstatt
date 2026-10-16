@@ -144,21 +144,36 @@ enum SelfTest {
         guard let doc = NSDocumentController.shared.documents.first as? WDocument, let wc = doc.controller, let w = wc.window else { return }
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
-        let c = wc.canvas
-        func page() -> PDFPage { doc.pdf.page(at: 0)! }
-        func lb(_ t: String) -> CGRect? { doc.pdf.findString(t, withOptions: []).first.map { $0.bounds(for: $0.pages.first!) } }
+        let sb = wc.sidebar
+        func firstLine(_ i: Int) -> String { (doc.pdf.page(at: i)?.string ?? "").split(separator: "\n").dropFirst().first.map(String.init) ?? "" }
         run([
-            { c.tool = .editText },
-            { let r = lb("Rechnungsdatum")!
-              _ = c.selectContent(at: CGPoint(x: r.midX, y: r.midY), on: page())
-              c.moveContentSelection(dx: 2000, dy: -3000)          // weit neben die Seite
-              note("nach Verschieben neben die Seite: Auswahl \(c.contentSel == nil ? "leer (richtig)" : "\(c.contentSel!.indices.count)")")
-              c.overlay.display() },
-            { c.overlay.display(); note("Overlay gezeichnet ohne Absturz") },
-            { let r = lb("Gesamtbetrag")!
-              _ = c.selectContent(at: CGPoint(x: r.midX, y: r.midY), on: page())
-              for _ in 0..<5 { c.moveContentSelection(dx: 15, dy: 10); c.overlay.display() }
-              note("5× verschoben und gezeichnet: Auswahl \(c.contentSel?.indices.count ?? 0)") },
+            { note("Seiten: \(doc.pdf.pageCount), Reihenfolge: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
+            { // Ziehen nach außen simulieren: Provider + Sitzung wie die Tabelle sie erzeugt
+              let p1 = sb.tableView(sb.table, pasteboardWriterForRow: 1) as! NSFilePromiseProvider
+              sb.tableView(sb.table, draggingSession: NSDraggingSession(), willBeginAt: .zero, forRowIndexes: IndexSet(integer: 1))
+              let name = sb.filePromiseProvider(p1, fileNameForType: "com.adobe.pdf")
+              let u = URL(fileURLWithPath: dir + "/" + name)
+              let sem = DispatchSemaphore(value: 0); var err: Error?
+              sb.filePromiseProvider(p1, writePromiseTo: u) { e in err = e; sem.signal() }
+              while sem.wait(timeout: .now()) == .timedOut { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+              let re = PDFDocument(url: u)
+              note("Eine Seite gezogen → '\(name)': \(err == nil ? "geschrieben" : "FEHLER \(err!)"), \(re?.pageCount ?? 0) Seite(n), Inhalt: '\((re?.page(at: 0)?.string ?? "").split(separator: "\n").dropFirst().first ?? "")'") },
+            { let rows = IndexSet([0, 2])
+              let ps = rows.map { sb.tableView(sb.table, pasteboardWriterForRow: $0) as! NSFilePromiseProvider }
+              sb.tableView(sb.table, draggingSession: NSDraggingSession(), willBeginAt: .zero, forRowIndexes: rows)
+              let types = ps.map { ($0 as! PagePromise).writableTypes(for: NSPasteboard.general).count }
+              let name = sb.filePromiseProvider(ps[0], fileNameForType: "com.adobe.pdf")
+              let u = URL(fileURLWithPath: dir + "/" + name)
+              let sem = DispatchSemaphore(value: 0)
+              sb.filePromiseProvider(ps[0], writePromiseTo: u) { _ in sem.signal() }
+              while sem.wait(timeout: .now()) == .timedOut { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+              note("Seiten 1+3 gezogen → '\(name)': \(PDFDocument(url: u)?.pageCount ?? 0) Seiten; Typen je Eintrag \(types) (zweiter nur intern)") },
+            { doc.movePages(IndexSet(integer: 2), to: 0); note("Seite 3 nach vorn: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
+            { sb.table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false); w.makeFirstResponder(sb.table)
+              key(51, "\u{7f}", w) },
+            { note("Rücktaste in Seitenleiste: \(doc.pdf.pageCount) Seiten: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
+            { cmdZ(w) }, { cmdZ(w) },
+            { note("2× ⌘Z: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
         ]) { finish(dir) }
     }
 

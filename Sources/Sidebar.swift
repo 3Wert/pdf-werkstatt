@@ -102,7 +102,26 @@ final class OutlineSource: NSObject, NSOutlineViewDataSource, NSOutlineViewDeleg
     }
 }
 
-final class SidebarController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
+/// Zieh-Quelle für Seiten: innerhalb der App die Zeilennummer, nach außen (Finder, Schreibtisch, Mail) eine PDF-Datei
+final class PagePromise: NSFilePromiseProvider {
+    var rowInfo = ""
+    var secondary = false      // bei Mehrfachauswahl schreibt nur der erste Eintrag die (gemeinsame) Datei
+
+    override func writableTypes(for pasteboard: NSPasteboard) -> [NSPasteboard.PasteboardType] {
+        secondary ? [SidebarController.rowType] : super.writableTypes(for: pasteboard) + [SidebarController.rowType]
+    }
+    override func writingOptions(forType type: NSPasteboard.PasteboardType, pasteboard: NSPasteboard) -> NSPasteboard.WritingOptions {
+        type == SidebarController.rowType ? [] : super.writingOptions(forType: type, pasteboard: pasteboard)
+    }
+    override func pasteboardPropertyList(forType type: NSPasteboard.PasteboardType) -> Any? {
+        type == SidebarController.rowType ? rowInfo : super.pasteboardPropertyList(forType: type)
+    }
+}
+
+final class SidebarController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate, NSFilePromiseProviderDelegate {
+    private var dragRows = IndexSet()
+    private var promises: [Int: PagePromise] = [:]
+    private let promiseQueue = OperationQueue()
     weak var wdoc: WDocument?
     weak var canvas: Canvas?
     var onPickAnnotation: ((PDFAnnotation) -> Void)?
@@ -392,10 +411,51 @@ final class SidebarController: NSViewController, NSTableViewDataSource, NSTableV
     var docID: String { wdoc.map { "\(ObjectIdentifier($0).hashValue)" } ?? "" }
 
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-        let item = NSPasteboardItem()
-        item.setString("\(docID):\(row)", forType: Self.rowType)
-        return item
+        let p = PagePromise(fileType: UTType.pdf.identifier, delegate: self)
+        p.rowInfo = "\(docID):\(row)"
+        p.userInfo = row
+        promises[row] = p
+        return p
     }
+
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rows: IndexSet) {
+        dragRows = rows
+        // Mehrere Seiten → eine gemeinsame Datei, geschrieben vom ersten Eintrag
+        for (r, p) in promises { p.secondary = r != rows.first }
+    }
+
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        promises.removeAll()
+    }
+
+    // MARK: Datei-Versprechen (Ziehen nach außen)
+
+    private var dragPages: [PDFPage] {
+        guard let d = pdf else { return [] }
+        return dragRows.compactMap { d.page(at: $0) }
+    }
+
+    func filePromiseProvider(_ p: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
+        let base = ((wdoc?.displayName ?? "Dokument") as NSString).deletingPathExtension
+        let rows = dragRows
+        if rows.count <= 1 { return "\(base) – Seite \((rows.first ?? 0) + 1).pdf" }
+        let list = rows.map { $0 + 1 }
+        let contiguous = list.last! - list.first! + 1 == list.count
+        return contiguous ? "\(base) – Seiten \(list.first!)-\(list.last!).pdf" : "\(base) – \(list.count) Seiten.pdf"
+    }
+
+    func filePromiseProvider(_ p: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler: @escaping (Error?) -> Void) {
+        // Daten auf dem Hauptthread erzeugen (PDFKit), Schreiben darf überall passieren
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let doc = self.wdoc else { completionHandler(CocoaError(.fileWriteUnknown)); return }
+            let out = doc.extract(self.dragPages)
+            let ok = out.pageCount > 0 && out.write(to: url)
+            Log.w("Seite(n) als Datei gezogen: \(url.lastPathComponent) – \(ok ? "ok" : "FEHLER")")
+            completionHandler(ok ? nil : CocoaError(.fileWriteUnknown))
+        }
+    }
+
+    func operationQueue(for p: NSFilePromiseProvider) -> OperationQueue { promiseQueue }
 
     private func parse(_ items: [NSPasteboardItem]) -> (String, IndexSet) {
         var id = ""; var rows = IndexSet()
