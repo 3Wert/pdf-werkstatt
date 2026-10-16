@@ -984,8 +984,9 @@ final class Canvas: PDFView, NSTextViewDelegate {
             var r = d.startRect.offsetBy(dx: ddx, dy: ddy)
             if !e.modifierFlags.contains(.command) {
                 var bl: CGFloat? = nil
-                if let w = d.obj as? WObject, w.model.isText, w.model.rot == 0 { bl = d.startBounds.maxY - w.firstBaselineY }
-                r = snap(r, page: d.page, exclude: [d.obj].compactMap { $0 } + d.others.map { $0.0 }, baselineFromTop: bl)
+                var inset: CGFloat = 0
+                if let w = d.obj as? WObject, w.model.isText, w.model.rot == 0 { bl = d.startBounds.maxY - w.firstBaselineY; inset = pad }
+                r = snap(r, page: d.page, exclude: [d.obj].compactMap { $0 } + d.others.map { $0.0 }, baselineFromTop: bl, textInset: inset)
             }
             d.obj?.bounds = convert(r, to: d.page)
             let mdx = r.minX - d.startRect.minX, mdy = r.minY - d.startRect.minY
@@ -1054,7 +1055,9 @@ final class Canvas: PDFView, NSTextViewDelegate {
             if shift { if abs(dx) > abs(dy) { ddy = 0 } else { ddx = 0 } }
             let p0 = convert(d.startView, to: d.page), p1 = convert(CGPoint(x: d.startView.x + ddx, y: d.startView.y + ddy), to: d.page)
             var off = CGVector(dx: p1.x - p0.x, dy: p1.y - p0.y)
-            if !e.modifierFlags.contains(.command), let cs = contentSel, cs.bounds.isUsable { off = snapOffset(bounds: cs.bounds, page: d.page, dx: off.dx, dy: off.dy) }
+            if !e.modifierFlags.contains(.command), let cs = contentSel, cs.bounds.isUsable {
+                off = snapOffset(bounds: cs.bounds, page: d.page, dx: off.dx, dy: off.dy, isText: cs.indices.count == 1 && cs.element.kind == .text)
+            }
             contentDragOffset = off
         }
         drag = d
@@ -1207,42 +1210,62 @@ final class Canvas: PDFView, NSTextViewDelegate {
         return src
     }
 
-    /// Rechteck (Ansichtskoordinaten) auf der Seite einrasten; `baseline` = y der Textgrundlinie relativ zur Oberkante (Seitenpunkte), falls Text
-    private func snap(_ r: CGRect, page: PDFPage, exclude: [PDFAnnotation], baselineFromTop: CGFloat? = nil) -> CGRect {
+    /// Rechteck (Ansichtskoordinaten) auf der Seite einrasten.
+    /// `textInset`: bei Textfeldern rastet die Textkante (Rahmen minus Innenabstand) ein, `baselineFromTop` die Grundlinie.
+    private func snap(_ r: CGRect, page: PDFPage, exclude: [PDFAnnotation], baselineFromTop: CGFloat? = nil, textInset: CGFloat = 0) -> CGRect {
         guard let src = snapSources(for: page, exclude: exclude) else { return r }
         let pr = convert(r, to: page)
         let tol = GuideSettings.shared.tolerance / max(scaleFactor, 0.01)
-        var xs: [(CGFloat, Bool)] = [(pr.minX, false), (pr.midX, false), (pr.maxX, false)]
-        var ys: [(CGFloat, Bool)] = [(pr.minY, false), (pr.midY, false), (pr.maxY, false)]
-        if let bl = baselineFromTop { ys.append((pr.maxY - bl, true)) }
-        _ = xs; _ = ys
+        let xs: [(CGFloat, Bool)] = [(pr.minX + textInset, false), (pr.midX, false), (pr.maxX - textInset, false)]
         var out = pr
         let hx = src.best(vertical: true, candidates: xs, tolerance: tol)
-        let hy = src.best(vertical: false, candidates: ys, tolerance: tol)
+        // Grundlinie hat Vorrang vor Rahmenkanten
+        var hy: SnapSources.Hit? = nil
+        if let bl = baselineFromTop { hy = src.best(vertical: false, candidates: [(pr.maxY - bl, true)], tolerance: tol) }
+        if hy == nil { hy = src.best(vertical: false, candidates: [(pr.minY, false), (pr.midY, false), (pr.maxY, false)], tolerance: tol) }
         if let h = hx { out.origin.x += h.delta }
         if let h = hy { out.origin.y += h.delta }
+        showGuides([hx, hy].compactMap { $0 }, page: page, around: out)
+        return convert(out, from: page)
+    }
+
+    private func showGuides(_ hits: [SnapSources.Hit], page: PDFPage, around out: CGRect) {
         let pb = page.bounds(for: .cropBox)
-        func show(_ h: SnapSources.Hit) {
+        for h in hits {
             let l = h.line
             let a: CGPoint, b: CGPoint
             if l.vertical { a = CGPoint(x: l.value, y: l.range?.lowerBound ?? pb.minY); b = CGPoint(x: l.value, y: l.range?.upperBound ?? pb.maxY) }
             else { a = CGPoint(x: l.range?.lowerBound ?? pb.minX, y: l.value); b = CGPoint(x: l.range?.upperBound ?? pb.maxX, y: l.value) }
-            // Linie bis zum Objekt verlängern, damit man den Bezug sieht
             var va = convert(a, from: page), vb = convert(b, from: page)
             let vo = convert(out, from: page)
             if l.vertical { va.y = min(va.y, vo.minY); vb.y = max(vb.y, vo.maxY) } else { va.x = min(va.x, vo.minX); vb.x = max(vb.x, vo.maxX) }
             guides.append(ShownGuide(a: va, b: vb, label: l.kind.rawValue))
         }
-        if let h = hx { show(h) }
-        if let h = hy { show(h) }
-        return convert(out, from: page)
     }
 
-    /// Verschiebung (Seitenpunkte) für PDF-Inhalt einrasten
-    private func snapOffset(bounds: CGRect, page: PDFPage, dx: CGFloat, dy: CGFloat) -> CGVector {
-        let moved = bounds.offsetBy(dx: dx, dy: dy)
-        let snapped = convert(snap(convert(moved, from: page), page: page, exclude: []), to: page)
-        return CGVector(dx: snapped.minX - bounds.minX, dy: snapped.minY - bounds.minY)
+    /// Verschiebung (Seitenpunkte) für PDF-Inhalt einrasten. Bei Text zählen die exakten Zeilenmaße (Kanten, Grundlinie).
+    private func snapOffset(bounds: CGRect, page: PDFPage, dx: CGFloat, dy: CGFloat, isText: Bool) -> CGVector {
+        guard let src = snapSources(for: page, exclude: []) else { return CGVector(dx: dx, dy: dy) }
+        let tol = GuideSettings.shared.tolerance / max(scaleFactor, 0.01)
+        var rect = bounds
+        var baseline: CGFloat? = nil
+        if isText, let line = page.selectionForLine(at: CGPoint(x: bounds.midX, y: bounds.midY)), !(line.string ?? "").trimmed.isEmpty {
+            let lb = line.bounds(for: page)
+            if lb.width > 1 { rect = lb }
+            var desc: CGFloat = -lb.height * 0.22
+            if let a = line.attributedString, a.length > 0, let f = a.attribute(.font, at: 0, effectiveRange: nil) as? NSFont { desc = f.descender }
+            baseline = lb.minY - desc
+        }
+        let moved = rect.offsetBy(dx: dx, dy: dy)
+        let hx = src.best(vertical: true, candidates: [(moved.minX, false), (moved.midX, false), (moved.maxX, false)], tolerance: tol)
+        var hy: SnapSources.Hit? = nil
+        if let bl = baseline { hy = src.best(vertical: false, candidates: [(bl + dy, true)], tolerance: tol) }
+        if hy == nil { hy = src.best(vertical: false, candidates: [(moved.minY, false), (moved.midY, false), (moved.maxY, false)], tolerance: tol) }
+        var out = CGVector(dx: dx, dy: dy)
+        if let h = hx { out.dx += h.delta }
+        if let h = hy { out.dy += h.delta }
+        showGuides([hx, hy].compactMap { $0 }, page: page, around: rect.offsetBy(dx: out.dx, dy: out.dy))
+        return out
     }
 
     // MARK: Eigene Hilfslinien
