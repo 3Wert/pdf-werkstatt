@@ -14,7 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Updater.start()
         SelfTest.runIfRequested()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            if ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil { Recovery.offerRestore() }
+            if ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil, ProcessInfo.processInfo.environment["PDFW_UPDATE_TEST"] == nil { Recovery.offerRestore() }
             if NSDocumentController.shared.documents.isEmpty { NSDocumentController.shared.openDocument(nil) }
         }
     }
