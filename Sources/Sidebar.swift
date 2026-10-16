@@ -419,6 +419,10 @@ final class SidebarController: NSViewController, NSTableViewDataSource, NSTableV
     }
 
     func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rows: IndexSet) {
+        beginDrag(rows: rows)
+    }
+
+    func beginDrag(rows: IndexSet) {
         dragRows = rows
         // Mehrere Seiten → eine gemeinsame Datei, geschrieben vom ersten Eintrag
         for (r, p) in promises { p.secondary = r != rows.first }

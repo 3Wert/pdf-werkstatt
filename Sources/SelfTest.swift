@@ -146,28 +146,26 @@ enum SelfTest {
         w.makeKeyAndOrderFront(nil)
         let sb = wc.sidebar
         func firstLine(_ i: Int) -> String { (doc.pdf.page(at: i)?.string ?? "").split(separator: "\n").dropFirst().first.map(String.init) ?? "" }
+        var u1 = URL(fileURLWithPath: "/dev/null"), u2 = u1
+        var e1: String = "ausstehend", e2: String = "ausstehend"
         run([
             { note("Seiten: \(doc.pdf.pageCount), Reihenfolge: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
-            { // Ziehen nach außen simulieren: Provider + Sitzung wie die Tabelle sie erzeugt
-              let p1 = sb.tableView(sb.table, pasteboardWriterForRow: 1) as! NSFilePromiseProvider
-              sb.tableView(sb.table, draggingSession: NSDraggingSession(), willBeginAt: .zero, forRowIndexes: IndexSet(integer: 1))
+            { let p1 = sb.tableView(sb.table, pasteboardWriterForRow: 1) as! NSFilePromiseProvider
+              sb.beginDrag(rows: IndexSet(integer: 1))
               let name = sb.filePromiseProvider(p1, fileNameForType: "com.adobe.pdf")
-              let u = URL(fileURLWithPath: dir + "/" + name)
-              let sem = DispatchSemaphore(value: 0); var err: Error?
-              sb.filePromiseProvider(p1, writePromiseTo: u) { e in err = e; sem.signal() }
-              while sem.wait(timeout: .now()) == .timedOut { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
-              let re = PDFDocument(url: u)
-              note("Eine Seite gezogen → '\(name)': \(err == nil ? "geschrieben" : "FEHLER \(err!)"), \(re?.pageCount ?? 0) Seite(n), Inhalt: '\((re?.page(at: 0)?.string ?? "").split(separator: "\n").dropFirst().first ?? "")'") },
+              u1 = URL(fileURLWithPath: dir + "/" + name)
+              sb.filePromiseProvider(p1, writePromiseTo: u1) { e in e1 = e.map { "FEHLER \($0)" } ?? "ok" } },
+            { let re = PDFDocument(url: u1)
+              note("Eine Seite gezogen → '\(u1.lastPathComponent)': \(e1), \(re?.pageCount ?? 0) Seite(n), Inhalt: '\((re?.page(at: 0)?.string ?? "").split(separator: "\n").dropFirst().first ?? "")'") },
             { let rows = IndexSet([0, 2])
-              let ps = rows.map { sb.tableView(sb.table, pasteboardWriterForRow: $0) as! NSFilePromiseProvider }
-              sb.tableView(sb.table, draggingSession: NSDraggingSession(), willBeginAt: .zero, forRowIndexes: rows)
-              let types = ps.map { ($0 as! PagePromise).writableTypes(for: NSPasteboard.general).count }
+              let ps = rows.map { sb.tableView(sb.table, pasteboardWriterForRow: $0) as! PagePromise }
+              sb.beginDrag(rows: rows)
+              let types = ps.map { $0.writableTypes(for: NSPasteboard.general).count }
               let name = sb.filePromiseProvider(ps[0], fileNameForType: "com.adobe.pdf")
-              let u = URL(fileURLWithPath: dir + "/" + name)
-              let sem = DispatchSemaphore(value: 0)
-              sb.filePromiseProvider(ps[0], writePromiseTo: u) { _ in sem.signal() }
-              while sem.wait(timeout: .now()) == .timedOut { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
-              note("Seiten 1+3 gezogen → '\(name)': \(PDFDocument(url: u)?.pageCount ?? 0) Seiten; Typen je Eintrag \(types) (zweiter nur intern)") },
+              u2 = URL(fileURLWithPath: dir + "/" + name)
+              note("Typen je Eintrag: \(types) (zweiter nur intern)")
+              sb.filePromiseProvider(ps[0], writePromiseTo: u2) { e in e2 = e.map { "FEHLER \($0)" } ?? "ok" } },
+            { note("Seiten 1+3 gezogen → '\(u2.lastPathComponent)': \(e2), \(PDFDocument(url: u2)?.pageCount ?? 0) Seiten") },
             { doc.movePages(IndexSet(integer: 2), to: 0); note("Seite 3 nach vorn: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
             { sb.table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false); w.makeFirstResponder(sb.table)
               key(51, "\u{7f}", w) },
