@@ -154,6 +154,8 @@ enum SelfTest {
         }
         var t1: WObject!, t2: WObject!
         GuideSettings.shared = GuideSettings()   // Standardwerte
+        GuideSettings.shared.tolerance = 14      // Test: 3 pt Abstand bei 4× Zoom = 12 px
+        func find(_ text: String) -> WObject? { page().annotations.compactMap { $0 as? WObject }.first { $0.model.text == text } }
         run([
             { c.go(to: PDFDestination(page: page(), at: CGPoint(x: 0, y: 760))) },
             { // Textfeld mit derselben Schrift wie die Zeile "Rechnungsdatum" anlegen, versetzt platzieren
@@ -196,6 +198,7 @@ enum SelfTest {
               note("PDF-Inhalt verschoben: linke Kante Δ zu 'Rechnungsdatum' \(String(format: "%.2f", after.minX - target.minX)) pt (≈ 0 = eingerastet)") },
             { // Eigene Hilfslinie bei x = 400 anlegen, Feld 1 darauf ziehen (3 pt daneben loslassen)
               c.tool = .textSelect
+              t1 = find("Rechnungsdatum: 16.10.2026")      // nach dem Inhalts-Eingriff sind alle Objekte neue Instanzen
               c.addCustomGuide(horizontal: false, atView: c.convert(CGPoint(x: 400, y: 500), from: page()))
               let dx = (400 + 3) - t1.bounds.minX
               dragObject(c, t1, by: CGVector(dx: dx * c.scaleFactor, dy: 0))
