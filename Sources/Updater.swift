@@ -24,6 +24,7 @@ enum Updater {
 
     /// Beim Start (nach 20 s) und dann alle 4 Stunden, nur wenn das Programm aus einem Programme-Ordner läuft
     static func start() {
+        if ProcessInfo.processInfo.environment["PDFW_UPDATE_TEST"] != nil { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { check(manual: true) }; return }
         guard ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil, isInstalled else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { check(manual: false) }
         timer = Timer.scheduledTimer(withTimeInterval: 4 * 3600, repeats: true) { _ in check(manual: false) }
@@ -77,6 +78,7 @@ enum Updater {
         a.informativeText = "Installiert ist \(currentVersion) (\(currentBuild)).\(notes)\n\nDie App wird ausgetauscht und neu gestartet. Offene Dokumente werden vorher gesichert."
         a.addButton(withTitle: "Jetzt installieren")
         a.addButton(withTitle: "Später")
+        if ProcessInfo.processInfo.environment["PDFW_UPDATE_TEST"] != nil { Log.w("Update-Test: Angebot \(info.version) \(info.build), installiere"); install(info, from: zipURL); return }
         if a.runModal() == .alertFirstButtonReturn { install(info, from: zipURL) }
         else { prefs.set(info.build, forKey: "updateSpaeter") }
     }
@@ -168,6 +170,8 @@ enum Updater {
     }
 
     private static func alert(_ title: String, _ text: String) {
+        Log.w("Update: \(title) – \(text)")
+        if ProcessInfo.processInfo.environment["PDFW_UPDATE_TEST"] != nil { NSApp.terminate(nil); return }
         let a = NSAlert(); a.messageText = title; a.informativeText = text; a.runModal()
     }
 }
