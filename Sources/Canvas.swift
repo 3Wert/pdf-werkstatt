@@ -1234,7 +1234,9 @@ final class Canvas: PDFView, NSTextViewDelegate {
         if let h = hx { out.origin.x += h.delta }
         if let h = hy { out.origin.y += h.delta }
         showGuides([hx, hy].compactMap { $0 }, page: page, around: out)
-        return convert(out, from: page)
+        let back = convert(out, from: page)
+        Log.v("snap: r=\(r) pr=\(pr) out=\(out) back=\(back) zurück=\(convert(back, to: page))")
+        return back
     }
 
     private func showGuides(_ hits: [SnapSources.Hit], page: PDFPage, around out: CGRect) {
