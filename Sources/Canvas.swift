@@ -265,7 +265,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
     private var editStart: (ObjModel, CGRect, Bool)?
     private let editorUndo = UndoManager()
 
-    private enum DragMode { case move, resize(Int), endpoint(Int), create, ink, marquee, selectRect, marqueeResize(Int), contentMove }
+    private enum DragMode { case move, resize(Int), endpoint(Int), create, ink, marquee, selectRect, marqueeResize(Int), contentMove, guide(Bool, Int) }
     private struct DragState {
         var mode: DragMode
         var page: PDFPage
@@ -281,7 +281,14 @@ final class Canvas: PDFView, NSTextViewDelegate {
     }
     private var drag: DragState?
     private var clickPoint: (PDFPage, CGPoint, CGPoint)?
-    private var guides: [(CGPoint, CGPoint)] = []
+    /// Fanglinien, die während des Ziehens angezeigt werden (Ansichtskoordinaten)
+    struct ShownGuide { var a: CGPoint; var b: CGPoint; var label: String }
+    private var guides: [ShownGuide] = []
+    private var snapCache: [Int: SnapSources] = [:]
+    private var snapSettingsStamp = 0
+    var customGuides: [Int: GuideStore.PageGuides] = [:] { didSet { overlay.needsDisplay = true; if let d = wdoc { GuideStore.save(d, customGuides) } } }
+    var previewGuide: (Bool, CGPoint)? { didSet { overlay.needsDisplay = true } }
+    var onViewChanged: (() -> Void)?
     private var lastCoalesce: (ObjectIdentifier, String, Date)?
     private var pasteOffset: CGFloat = 0
     private var tracking: NSTrackingArea?
@@ -372,10 +379,10 @@ final class Canvas: PDFView, NSTextViewDelegate {
         bringOverlayToFront(); observeScrolling()
     }
 
-    @objc private func pageDidChange() { prewarmContent() }
+    @objc private func pageDidChange() { prewarmContent(); onViewChanged?() }
 
-    @objc private func scrolled() { positionEditor(); positionCropBar(); overlay.needsDisplay = true }
-    @objc private func scaleChanged() { styleEditor(); positionCropBar(); overlay.needsDisplay = true }
+    @objc private func scrolled() { positionEditor(); positionCropBar(); overlay.needsDisplay = true; onViewChanged?() }
+    @objc private func scaleChanged() { styleEditor(); positionCropBar(); overlay.needsDisplay = true; onViewChanged?() }
 
     // MARK: Zuschneiden
 
@@ -565,6 +572,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
 
     func refresh(_ a: PDFAnnotation?) {
         wdoc?.touch()
+        snapCache.removeAll()
         overlay.needsDisplay = true
         guard let a, let p = a.page else { return }
         annotationsChanged(on: p)
@@ -750,6 +758,12 @@ final class Canvas: PDFView, NSTextViewDelegate {
         }
         guard let page = page(for: vp, nearest: true) else { super.mouseDown(with: e); return }
         let pp = convert(vp, to: page)
+
+        // Eigene Hilfslinie anfassen (verschieben; außerhalb der Seite loslassen löscht sie)
+        if tool == .textSelect || tool == .editText, let (horizontal, i, gp) = customGuide(at: vp) {
+            drag = DragState(mode: .guide(horizontal, i), page: gp, startView: vp, startRect: .zero, startBounds: .zero, startModel: nil, obj: nil)
+            return
+        }
 
         // Formularfelder (Widgets) bedient PDFKit selbst
         if tool == .textSelect || tool == .editText, let f = page.annotation(at: pp), f.type == "Widget" {
@@ -968,7 +982,11 @@ final class Canvas: PDFView, NSTextViewDelegate {
             var ddx = dx, ddy = dy
             if shift { if abs(dx) > abs(dy) { ddy = 0 } else { ddx = 0 } }
             var r = d.startRect.offsetBy(dx: ddx, dy: ddy)
-            if !e.modifierFlags.contains(.command) && d.others.isEmpty { r = snap(r, page: d.page, exclude: d.obj) }
+            if !e.modifierFlags.contains(.command) {
+                var bl: CGFloat? = nil
+                if let w = d.obj as? WObject, w.model.isText, w.model.rot == 0 { bl = d.startBounds.maxY - w.firstBaselineY }
+                r = snap(r, page: d.page, exclude: [d.obj].compactMap { $0 } + d.others.map { $0.0 }, baselineFromTop: bl)
+            }
             d.obj?.bounds = convert(r, to: d.page)
             let mdx = r.minX - d.startRect.minX, mdy = r.minY - d.startRect.minY
             for (o, b0, _) in d.others {
@@ -1023,12 +1041,21 @@ final class Canvas: PDFView, NSTextViewDelegate {
         case .marqueeResize(let h):
             let r = resized(d.startRect, handle: h, dx: dx, dy: dy, keepAspect: shift)
             marquee = (d.page, convert(r, to: d.page).intersection(d.page.bounds(for: .mediaBox)))
+        case .guide(let horizontal, let i):
+            guard let doc = document else { break }
+            let idx = doc.index(for: d.page)
+            var g = customGuides[idx] ?? GuideStore.PageGuides()
+            let pp = convert(vp, to: d.page)
+            if horizontal, i < g.y.count { g.y[i] = pp.y } else if !horizontal, i < g.x.count { g.x[i] = pp.x }
+            customGuides[idx] = g
         case .contentMove:
             guard contentSel?.canMove ?? true else { break }
             var ddx = dx, ddy = dy
             if shift { if abs(dx) > abs(dy) { ddy = 0 } else { ddx = 0 } }
             let p0 = convert(d.startView, to: d.page), p1 = convert(CGPoint(x: d.startView.x + ddx, y: d.startView.y + ddy), to: d.page)
-            contentDragOffset = CGVector(dx: p1.x - p0.x, dy: p1.y - p0.y)
+            var off = CGVector(dx: p1.x - p0.x, dy: p1.y - p0.y)
+            if !e.modifierFlags.contains(.command), let cs = contentSel, cs.bounds.isUsable { off = snapOffset(bounds: cs.bounds, page: d.page, dx: off.dx, dy: off.dy) }
+            contentDragOffset = off
         }
         drag = d
         if let o = d.obj { annotationsChanged(on: d.page); _ = o }
@@ -1088,6 +1115,16 @@ final class Canvas: PDFView, NSTextViewDelegate {
             updateCropBar()
         case .selectRect:
             objectMarquee = nil
+        case .guide(let horizontal, let i):
+            // außerhalb der Seite losgelassen → Hilfslinie löschen
+            guard let doc = document else { break }
+            let idx = doc.index(for: d.page)
+            var g = customGuides[idx] ?? GuideStore.PageGuides()
+            let pb = d.page.bounds(for: .cropBox).insetBy(dx: -10, dy: -10)
+            if horizontal, i < g.y.count, !(pb.minY...pb.maxY).contains(g.y[i]) { g.y.remove(at: i) }
+            if !horizontal, i < g.x.count, !(pb.minX...pb.maxX).contains(g.x[i]) { g.x.remove(at: i) }
+            customGuides[idx] = g
+            guideSettingsChanged()
         case .contentMove:
             let off = contentDragOffset
             contentDragOffset = .zero
@@ -1154,21 +1191,86 @@ final class Canvas: PDFView, NSTextViewDelegate {
         return r
     }
 
-    private func snap(_ r: CGRect, page: PDFPage, exclude: PDFAnnotation?) -> CGRect {
-        let pr = convert(page.bounds(for: .cropBox), from: page)
-        var xs = [pr.minX, pr.midX, pr.maxX], ys = [pr.minY, pr.midY, pr.maxY]
-        for a in page.annotations where a !== exclude && a is WObject {
-            let b = convert(a.bounds, from: page)
-            xs += [b.minX, b.midX, b.maxX]; ys += [b.minY, b.midY, b.maxY]
+    // MARK: Einrasten (Hilfslinien)
+
+    func guideSettingsChanged() { snapSettingsStamp += 1; snapCache.removeAll(); overlay.needsDisplay = true }
+
+    private func snapSources(for page: PDFPage, exclude: [PDFAnnotation]) -> SnapSources? {
+        guard let d = document else { return nil }
+        let idx = d.index(for: page)
+        let gen = (wdoc?.generation ?? 0) * 1000 + snapSettingsStamp
+        if let c = snapCache[idx], c.generation == gen, exclude.isEmpty { return c }
+        let cg = customGuides[idx] ?? GuideStore.PageGuides()
+        let src = SnapSources(page: page, pageIndex: idx, generation: gen, exclude: exclude, content: contentCache[idx],
+                              custom: (cg.x, cg.y), settings: GuideSettings.shared)
+        if exclude.isEmpty { snapCache[idx] = src }
+        return src
+    }
+
+    /// Rechteck (Ansichtskoordinaten) auf der Seite einrasten; `baseline` = y der Textgrundlinie relativ zur Oberkante (Seitenpunkte), falls Text
+    private func snap(_ r: CGRect, page: PDFPage, exclude: [PDFAnnotation], baselineFromTop: CGFloat? = nil) -> CGRect {
+        guard let src = snapSources(for: page, exclude: exclude) else { return r }
+        let pr = convert(r, to: page)
+        let tol = GuideSettings.shared.tolerance / max(scaleFactor, 0.01)
+        var xs: [(CGFloat, Bool)] = [(pr.minX, false), (pr.midX, false), (pr.maxX, false)]
+        var ys: [(CGFloat, Bool)] = [(pr.minY, false), (pr.midY, false), (pr.maxY, false)]
+        if let bl = baselineFromTop { ys.append((pr.maxY - bl, true)) }
+        _ = xs; _ = ys
+        var out = pr
+        let hx = src.best(vertical: true, candidates: xs, tolerance: tol)
+        let hy = src.best(vertical: false, candidates: ys, tolerance: tol)
+        if let h = hx { out.origin.x += h.delta }
+        if let h = hy { out.origin.y += h.delta }
+        let pb = page.bounds(for: .cropBox)
+        func show(_ h: SnapSources.Hit) {
+            let l = h.line
+            let a: CGPoint, b: CGPoint
+            if l.vertical { a = CGPoint(x: l.value, y: l.range?.lowerBound ?? pb.minY); b = CGPoint(x: l.value, y: l.range?.upperBound ?? pb.maxY) }
+            else { a = CGPoint(x: l.range?.lowerBound ?? pb.minX, y: l.value); b = CGPoint(x: l.range?.upperBound ?? pb.maxX, y: l.value) }
+            // Linie bis zum Objekt verlängern, damit man den Bezug sieht
+            var va = convert(a, from: page), vb = convert(b, from: page)
+            let vo = convert(out, from: page)
+            if l.vertical { va.y = min(va.y, vo.minY); vb.y = max(vb.y, vo.maxY) } else { va.x = min(va.x, vo.minX); vb.x = max(vb.x, vo.maxX) }
+            guides.append(ShownGuide(a: va, b: vb, label: l.kind.rawValue))
         }
-        let t: CGFloat = 5
-        var out = r
-        var bx: (CGFloat, CGFloat)?, by: (CGFloat, CGFloat)?
-        for c in [r.minX, r.midX, r.maxX] { for x in xs { let dl = x - c; if abs(dl) < t, bx == nil || abs(dl) < abs(bx!.0) { bx = (dl, x) } } }
-        for c in [r.minY, r.midY, r.maxY] { for y in ys { let dl = y - c; if abs(dl) < t, by == nil || abs(dl) < abs(by!.0) { by = (dl, y) } } }
-        if let bx { out.origin.x += bx.0; guides.append((CGPoint(x: bx.1, y: pr.minY), CGPoint(x: bx.1, y: pr.maxY))) }
-        if let by { out.origin.y += by.0; guides.append((CGPoint(x: pr.minX, y: by.1), CGPoint(x: pr.maxX, y: by.1))) }
-        return out
+        if let h = hx { show(h) }
+        if let h = hy { show(h) }
+        return convert(out, from: page)
+    }
+
+    /// Verschiebung (Seitenpunkte) für PDF-Inhalt einrasten
+    private func snapOffset(bounds: CGRect, page: PDFPage, dx: CGFloat, dy: CGFloat) -> CGVector {
+        let moved = bounds.offsetBy(dx: dx, dy: dy)
+        let snapped = convert(snap(convert(moved, from: page), page: page, exclude: []), to: page)
+        return CGVector(dx: snapped.minX - bounds.minX, dy: snapped.minY - bounds.minY)
+    }
+
+    // MARK: Eigene Hilfslinien
+
+    func addCustomGuide(horizontal: Bool, atView vp: CGPoint) {
+        guard let d = document, let page = page(for: vp, nearest: true) else { return }
+        let pp = convert(vp, to: page)
+        let pb = page.bounds(for: .cropBox)
+        guard pb.insetBy(dx: -20, dy: -20).contains(pp) else { return }
+        let idx = d.index(for: page)
+        var g = customGuides[idx] ?? GuideStore.PageGuides()
+        if horizontal { g.y.append(pp.y) } else { g.x.append(pp.x) }
+        customGuides[idx] = g
+        guideSettingsChanged()
+    }
+
+    func clearCustomGuides(pageOnly: Bool) {
+        if pageOnly, let d = document, let p = currentPage { customGuides[d.index(for: p)] = nil } else { customGuides = [:] }
+        guideSettingsChanged()
+    }
+
+    /// Eigene Hilfslinie nahe einem Punkt (Ansichtskoordinaten): (horizontal, Index)
+    private func customGuide(at vp: CGPoint) -> (Bool, Int, PDFPage)? {
+        guard GuideSettings.shared.showCustom, let d = document, let page = page(for: vp, nearest: false) else { return nil }
+        let g = customGuides[d.index(for: page)] ?? GuideStore.PageGuides()
+        for (i, x) in g.x.enumerated() { if abs(convert(CGPoint(x: x, y: 0), from: page).x - vp.x) <= 4 { return (false, i, page) } }
+        for (i, y) in g.y.enumerated() { if abs(convert(CGPoint(x: 0, y: y), from: page).y - vp.y) <= 4 { return (true, i, page) } }
+        return nil
     }
 
     override func mouseMoved(with e: NSEvent) {
@@ -1176,6 +1278,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
         let vp = viewPoint(e)
         if loupe { loupePoint = vp; overlay.needsDisplay = true }
         if handleAt(vp) != nil { NSCursor.crosshair.set(); return }
+        if let (h, _, _) = customGuide(at: vp) { (h ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set(); return }
         if let (a, _) = objectAt(vp), canMove(a) { NSCursor.openHand.set(); return }
         switch tool {
         case .rectSelect, .draw, .sketch, .whiteout, .redact: NSCursor.crosshair.set()
@@ -1982,13 +2085,56 @@ final class Canvas: PDFView, NSTextViewDelegate {
         }
     }
 
+    /// Raster, eigene Hilfslinien und die Vorschau beim Ziehen aus dem Lineal
+    private func drawStaticGuides() {
+        let st = GuideSettings.shared
+        guard let d = document else { return }
+        let visible = overlay.bounds
+        for i in 0..<d.pageCount {
+            guard let p = d.page(at: i) else { continue }
+            let pb = p.bounds(for: .cropBox)
+            let pr = convert(pb, from: p)
+            guard pr.intersects(visible) else { continue }
+            if st.showGrid, st.gridMM > 0 {
+                let g = st.gridMM * 72 / 25.4
+                guard g * scaleFactor >= 4 else { continue }
+                NSColor.systemBlue.withAlphaComponent(0.12).setStroke()
+                let path = NSBezierPath(); path.lineWidth = 0.5
+                var x = pb.minX; while x <= pb.maxX { let a = convert(CGPoint(x: x, y: pb.minY), from: p), b = convert(CGPoint(x: x, y: pb.maxY), from: p); path.move(to: a); path.line(to: b); x += g }
+                var y = pb.minY; while y <= pb.maxY { let a = convert(CGPoint(x: pb.minX, y: y), from: p), b = convert(CGPoint(x: pb.maxX, y: y), from: p); path.move(to: a); path.line(to: b); y += g }
+                path.stroke()
+            }
+            if st.showCustom, let cg = customGuides[i] {
+                NSColor.systemCyan.setStroke()
+                let path = NSBezierPath(); path.lineWidth = 1
+                for x in cg.x { path.move(to: convert(CGPoint(x: x, y: pb.minY), from: p)); path.line(to: convert(CGPoint(x: x, y: pb.maxY), from: p)) }
+                for y in cg.y { path.move(to: convert(CGPoint(x: pb.minX, y: y), from: p)); path.line(to: convert(CGPoint(x: pb.maxX, y: y), from: p)) }
+                path.stroke()
+            }
+        }
+        if let (horizontal, vp) = previewGuide {
+            NSColor.systemCyan.withAlphaComponent(0.7).setStroke()
+            let path = NSBezierPath(); path.lineWidth = 1; path.setLineDash([4, 3], count: 2, phase: 0)
+            if horizontal { path.move(to: CGPoint(x: 0, y: vp.y)); path.line(to: CGPoint(x: bounds.width, y: vp.y)) }
+            else { path.move(to: CGPoint(x: vp.x, y: 0)); path.line(to: CGPoint(x: vp.x, y: bounds.height)) }
+            path.stroke()
+        }
+    }
+
     func drawOverlay() {
         drawObjects()
         defer { drawLoupe() }
         let accent = NSColor.controlAccentColor
+        drawStaticGuides()
         for g in guides {
             NSColor.systemPink.setStroke()
-            let p = NSBezierPath(); p.move(to: g.0); p.line(to: g.1); p.lineWidth = 1; p.stroke()
+            let p = NSBezierPath(); p.move(to: g.a); p.line(to: g.b); p.lineWidth = 1; p.stroke()
+            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.white]
+            let sz = (g.label as NSString).size(withAttributes: attrs)
+            let vertical = abs(g.a.x - g.b.x) < 0.5
+            let box = vertical ? CGRect(x: g.a.x + 4, y: min(g.a.y, g.b.y) + 4, width: sz.width + 8, height: sz.height + 2)
+                               : CGRect(x: min(g.a.x, g.b.x) + 4, y: g.a.y + 4, width: sz.width + 8, height: sz.height + 2)
+            if box.isUsable { NSColor.systemPink.setFill(); NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3).fill(); (g.label as NSString).draw(at: CGPoint(x: box.minX + 4, y: box.minY + 1), withAttributes: attrs) }
         }
         if let d = drag, case .ink = d.mode, d.inkPoints.count > 1 {
             let p = NSBezierPath()

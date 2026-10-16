@@ -144,34 +144,72 @@ enum SelfTest {
         guard let doc = NSDocumentController.shared.documents.first as? WDocument, let wc = doc.controller, let w = wc.window else { return }
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
-        let sb = wc.sidebar
-        func firstLine(_ i: Int) -> String { (doc.pdf.page(at: i)?.string ?? "").split(separator: "\n").dropFirst().first.map(String.init) ?? "" }
-        var u1 = URL(fileURLWithPath: "/dev/null"), u2 = u1
-        var e1: String = "ausstehend", e2: String = "ausstehend"
+        let c = wc.canvas
+        func page() -> PDFPage { doc.pdf.page(at: 0)! }
+        func lb(_ t: String) -> CGRect? { doc.pdf.findString(t, withOptions: []).first.map { $0.bounds(for: $0.pages.first!) } }
+        func baseline(_ t: String) -> CGFloat {
+            let sel = doc.pdf.findString(t, withOptions: []).first!
+            let f = sel.attributedString!.attribute(.font, at: 0, effectiveRange: nil) as! NSFont
+            return sel.bounds(for: page()).minY - f.descender
+        }
+        var t1: WObject!, t2: WObject!
+        GuideSettings.shared = GuideSettings()   // Standardwerte
         run([
-            { note("Seiten: \(doc.pdf.pageCount), Reihenfolge: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
-            { let p1 = sb.tableView(sb.table, pasteboardWriterForRow: 1) as! NSFilePromiseProvider
-              sb.beginDrag(rows: IndexSet(integer: 1))
-              let name = sb.filePromiseProvider(p1, fileNameForType: "com.adobe.pdf")
-              u1 = URL(fileURLWithPath: dir + "/" + name)
-              sb.filePromiseProvider(p1, writePromiseTo: u1) { e in e1 = e.map { "FEHLER \($0)" } ?? "ok" } },
-            { let re = PDFDocument(url: u1)
-              note("Eine Seite gezogen → '\(u1.lastPathComponent)': \(e1), \(re?.pageCount ?? 0) Seite(n), Inhalt: '\((re?.page(at: 0)?.string ?? "").split(separator: "\n").dropFirst().first ?? "")'") },
-            { let rows = IndexSet([0, 2])
-              let ps = rows.map { sb.tableView(sb.table, pasteboardWriterForRow: $0) as! PagePromise }
-              sb.beginDrag(rows: rows)
-              let types = ps.map { $0.writableTypes(for: NSPasteboard.general).count }
-              let name = sb.filePromiseProvider(ps[0], fileNameForType: "com.adobe.pdf")
-              u2 = URL(fileURLWithPath: dir + "/" + name)
-              note("Typen je Eintrag: \(types) (zweiter nur intern)")
-              sb.filePromiseProvider(ps[0], writePromiseTo: u2) { e in e2 = e.map { "FEHLER \($0)" } ?? "ok" } },
-            { note("Seiten 1+3 gezogen → '\(u2.lastPathComponent)': \(e2), \(PDFDocument(url: u2)?.pageCount ?? 0) Seiten") },
-            { doc.movePages(IndexSet(integer: 2), to: 0); note("Seite 3 nach vorn: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
-            { sb.table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false); w.makeFirstResponder(sb.table)
-              key(51, "\u{7f}", w) },
-            { note("Rücktaste in Seitenleiste: \(doc.pdf.pageCount) Seiten: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
-            { cmdZ(w) }, { cmdZ(w) },
-            { note("2× ⌘Z: \((0..<doc.pdf.pageCount).map { firstLine($0) })") },
+            { c.go(to: PDFDestination(page: page(), at: CGPoint(x: 0, y: 760))) },
+            { // Textfeld mit derselben Schrift wie die Zeile "Rechnungsdatum" anlegen, versetzt platzieren
+              var m = Defaults.newModel(.text); m.text = "Rechnungsdatum: 16.10.2026"; m.fontName = "ArialMT"; m.fontSize = 11
+              t1 = WObject(model: m, bounds: CGRect(x: 300, y: 600, width: 10, height: 10)); c.add(t1, to: page(), action: "Text"); t1.fitBounds()
+              let target = lb("Rechnungsdatum")!
+              // nach links/oben in die Nähe der PDF-Zeile ziehen: 3 pt daneben, 3 pt zu hoch
+              let goalX = target.minX - pad + 3, goalBase = baseline("Rechnungsdatum") + 3
+              let dx = goalX - t1.bounds.minX, dy = goalBase - t1.firstBaselineY
+              let s = c.scaleFactor
+              dragObject(c, t1, by: CGVector(dx: dx * s, dy: (c.isFlipped ? -dy : dy) * s))
+              note("Feld 1 an PDF-Zeile: linke Kante Δ \(String(format: "%.2f", t1.bounds.minX + pad - target.minX)) pt, Grundlinie Δ \(String(format: "%.2f", t1.firstBaselineY - baseline("Rechnungsdatum"))) pt (beide ≈ 0 = eingerastet)") },
+            { // zweites Feld darunter: Zeilenabstand der PDF-Zeilen "Sehr geehrte"/"für die" ist der Maßstab
+              let g1 = baseline("Sehr geehrte"), g2 = baseline("für die Hausmeister")
+              let spacing = g1 - g2
+              var m = Defaults.newModel(.text); m.text = "Zweite Zeile"; m.fontName = "ArialMT"; m.fontSize = 11
+              t2 = WObject(model: m, bounds: CGRect(x: 300, y: 500, width: 10, height: 10)); c.add(t2, to: page(), action: "Text"); t2.fitBounds()
+              let lbLeist = lb("Leistungszeitraum")!
+              let g3 = baseline("Leistungszeitraum")
+              let goalBase = g3 - spacing + 2.5        // eine Zeile unter der letzten Brieftextzeile, 2,5 pt daneben
+              let dx = (lbLeist.minX - pad + 2) - t2.bounds.minX, dy = goalBase - t2.firstBaselineY
+              let s = c.scaleFactor
+              dragObject(c, t2, by: CGVector(dx: dx * s, dy: (c.isFlipped ? -dy : dy) * s))
+              note("Feld 2 unter den Brieftext: Grundlinie Δ zum Zeilenabstand \(String(format: "%.2f", t2.firstBaselineY - (g3 - spacing))) pt, linke Kante Δ \(String(format: "%.2f", t2.bounds.minX + pad - lbLeist.minX)) pt") },
+            { // PDF-Inhalt verschieben: Überschrift rastet mit linker Kante an "Rechnungsdatum" ein
+              c.tool = .editText
+              let r = lb("Rechnung Nr.")!
+              _ = c.selectContent(at: CGPoint(x: r.midX, y: r.midY), on: page())
+              let before = c.contentSel!.bounds
+              let target = lb("Rechnungsdatum")!
+              let dx = (target.minX + 20 + 3) - before.minX     // 3 pt neben einer Kante … aber Kante liegt bei target.minX → testen mit kleiner Abweichung
+              _ = dx
+              c.tool = .editText
+              let a = c.convert(c.convert(CGPoint(x: before.midX, y: before.midY), from: page()), to: nil)
+              let s = c.scaleFactor
+              let b = CGPoint(x: a.x + (target.minX - before.minX + 3) * s, y: a.y)
+              for i in 1...5 { w.postEvent(mouse(.leftMouseDragged, w, CGPoint(x: a.x + (b.x - a.x) * CGFloat(i) / 5, y: a.y)), atStart: false) }
+              w.postEvent(mouse(.leftMouseUp, w, b), atStart: false); w.sendEvent(mouse(.leftMouseDown, w, a))
+              let after = lb("Rechnung Nr.")!
+              note("PDF-Inhalt verschoben: linke Kante Δ zu 'Rechnungsdatum' \(String(format: "%.2f", after.minX - target.minX)) pt (≈ 0 = eingerastet)") },
+            { // Eigene Hilfslinie bei x = 400 anlegen, Feld 1 darauf ziehen (3 pt daneben loslassen)
+              c.tool = .textSelect
+              c.addCustomGuide(horizontal: false, atView: c.convert(CGPoint(x: 400, y: 500), from: page()))
+              let dx = (400 + 3) - t1.bounds.minX
+              dragObject(c, t1, by: CGVector(dx: dx * c.scaleFactor, dy: 0))
+              note("Eigene Hilfslinie x=400: Feld 1 linke Kante \(String(format: "%.2f", t1.bounds.minX)) (400 = eingerastet), gespeichert: \(c.customGuides[0]?.x ?? [])") },
+            { // ⌘ gedrückt → kein Einrasten
+              let a = c.convert(c.convert(CGPoint(x: t1.bounds.midX, y: t1.bounds.midY), from: page()), to: nil)
+              let b = CGPoint(x: a.x - 3 * c.scaleFactor, y: a.y)
+              let down = NSEvent.mouseEvent(with: .leftMouseDown, location: a, modifierFlags: [], timestamp: 0, windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+              for i in 1...4 { w.postEvent(NSEvent.mouseEvent(with: .leftMouseDragged, location: CGPoint(x: a.x + (b.x - a.x) * CGFloat(i) / 4, y: a.y), modifierFlags: [.command], timestamp: 0, windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!, atStart: false) }
+              w.postEvent(mouse(.leftMouseUp, w, b), atStart: false); w.sendEvent(down)
+              note("mit ⌘ gezogen: linke Kante \(String(format: "%.2f", t1.bounds.minX)) (≈ 397 = nicht eingerastet)") },
+            { GuideSettings.shared.showRulers = true; GuideSettings.shared.showGrid = true; wc.applyGuideSettings(); c.overlay.display()
+              note("Lineale und Raster an, gezeichnet ohne Absturz") },
+            { GuideSettings.shared = GuideSettings(); wc.applyGuideSettings() },
         ]) { finish(dir) }
     }
 

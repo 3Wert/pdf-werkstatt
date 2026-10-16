@@ -44,6 +44,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     private var shareButton: NSButton?
     private var sharePicker: NSSharingServicePicker?
     private var infoPanel: InfoPanel?
+    private let rulerTop = RulerView(horizontal: true)
+    private let rulerLeft = RulerView(horizontal: false)
     private var popover: NSPopover?
     private(set) var sidebarMode: SidebarMode = .thumbnails
     var wdoc: WDocument? { document as? WDocument }
@@ -74,6 +76,13 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
                                          v.topAnchor.constraint(equalTo: content.topAnchor), v.bottomAnchor.constraint(equalTo: content.bottomAnchor)])
         }
         contactSheet.isHidden = true
+        for r in [rulerTop, rulerLeft] { r.canvas = canvas; r.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(r) }
+        NSLayoutConstraint.activate([
+            rulerTop.topAnchor.constraint(equalTo: content.topAnchor), rulerTop.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: RulerView.thickness),
+            rulerTop.trailingAnchor.constraint(equalTo: content.trailingAnchor), rulerTop.heightAnchor.constraint(equalToConstant: RulerView.thickness),
+            rulerLeft.topAnchor.constraint(equalTo: content.topAnchor, constant: RulerView.thickness), rulerLeft.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            rulerLeft.bottomAnchor.constraint(equalTo: content.bottomAnchor), rulerLeft.widthAnchor.constraint(equalToConstant: RulerView.thickness),
+        ])
         let centerVC = NSViewController()
         centerVC.view = content
         content.widthAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
@@ -102,6 +111,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         w.toolbar = tb
 
         canvas.document = doc.pdf
+        canvas.customGuides = GuideStore.load(doc)
+        canvas.onViewChanged = { [weak self] in self?.rulerTop.needsDisplay = true; self?.rulerLeft.needsDisplay = true }
+        applyGuideSettings()
         canvas.onToolChange = { [weak self] _ in self?.toolStateChanged() }
         canvas.onSelectionChange = { [weak self] a in
             self?.inspector.show(a)
@@ -475,6 +487,24 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     }
 
     @objc func toggleInspector(_ s: Any?) { inspItem.animator().isCollapsed.toggle() }
+
+    // MARK: Hilfslinien
+
+    func applyGuideSettings() {
+        let st = GuideSettings.shared
+        rulerTop.isHidden = !st.showRulers
+        rulerLeft.isHidden = !st.showRulers
+        rulerTop.needsDisplay = true; rulerLeft.needsDisplay = true
+        canvas.guideSettingsChanged()
+    }
+    @objc func guideSettings(_ s: Any?) {
+        guard let w = window else { return }
+        GuideDialog.show(window: w) { [weak self] in self?.applyGuideSettings() }
+    }
+    @objc func toggleRulers(_ s: Any?) { GuideSettings.shared.showRulers.toggle(); applyGuideSettings() }
+    @objc func toggleGrid(_ s: Any?) { GuideSettings.shared.showGrid.toggle(); applyGuideSettings() }
+    @objc func clearGuidesPage(_ s: Any?) { canvas.clearCustomGuides(pageOnly: true) }
+    @objc func clearGuidesAll(_ s: Any?) { canvas.clearCustomGuides(pageOnly: false) }
 
     // MARK: Hervorheben
 
