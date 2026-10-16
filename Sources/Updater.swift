@@ -1,7 +1,7 @@
 import AppKit
 import CryptoKit
 
-/// Update-Prüfung: liest `aktuell.json` aus iCloud Drive (eigene Macs) oder von einer Web-Adresse (Kollegen),
+/// Update-Prüfung über GitHub-Releases (github.com/3Wert/pdf-werkstatt): liest `aktuell.json` des neuesten Releases,
 /// lädt die Zip, prüft die Prüfsumme, tauscht die App im Programme-Ordner aus und startet neu.
 /// Die alte Version bleibt als „PDF-Werkstatt (alt).app“ liegen, bis das nächste Update kommt.
 enum Updater {
@@ -14,9 +14,8 @@ enum Updater {
         var notes: [String]
     }
 
-    static let icloudDir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/Backups/PDFWerkstatt")
-    static let webBase = URL(string: "https://3wert.de/pdf-werkstatt/")!
+    /// „latest/download/<Datei>“ leitet GitHub immer auf das neueste Release um – keine API, kein Token
+    static let webBase = URL(string: "https://github.com/3Wert/pdf-werkstatt/releases/latest/download/")!
     static var currentBuild: String { Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0" }
     static var currentVersion: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0" }
     private static var timer: Timer?
@@ -38,12 +37,6 @@ enum Updater {
     // MARK: Quelle lesen
 
     private static func fetch(_ done: @escaping (Info?, URL?, Error?) -> Void) {
-        // 1. iCloud Drive
-        let local = icloudDir.appendingPathComponent("aktuell.json")
-        if let d = try? Data(contentsOf: local), let i = try? JSONDecoder().decode(Info.self, from: d) {
-            done(i, icloudDir.appendingPathComponent(i.file), nil); return
-        }
-        // 2. Web
         var req = URLRequest(url: webBase.appendingPathComponent("aktuell.json"))
         req.cachePolicy = .reloadIgnoringLocalCacheData
         req.timeoutInterval = 15
@@ -59,7 +52,7 @@ enum Updater {
         guard !busy else { return }
         fetch { info, zipURL, err in
             guard let info, let zipURL else {
-                if manual { alert("Keine Update-Informationen gefunden", err.map { "\($0.localizedDescription)" } ?? "Weder in iCloud Drive noch unter \(webBase.absoluteString) liegt eine aktuell.json.") }
+                if manual { alert("Keine Update-Informationen gefunden", err.map { "\($0.localizedDescription)" } ?? "Unter \(webBase.absoluteString) liegt keine aktuell.json – kein Release vorhanden oder keine Verbindung.") }
                 return
             }
             guard info.build > currentBuild else {
@@ -107,27 +100,18 @@ enum Updater {
         win.makeKeyAndOrderFront(nil)   // nicht modal, damit der Download laufen kann
         loadZip(zipURL, expected: info.sha256) { data in
             win.orderOut(nil)
-            guard let data else { busy = false; alert("Update fehlgeschlagen", "Die Datei konnte nicht geladen werden oder die Prüfsumme stimmt nicht. Vielleicht ist iCloud noch nicht fertig synchronisiert – später noch einmal versuchen."); return }
+            guard let data else { busy = false; alert("Update fehlgeschlagen", "Die Datei konnte nicht von GitHub geladen werden oder die Prüfsumme stimmt nicht. Später noch einmal versuchen."); return }
             do { try swap(zipData: data) } catch { busy = false; alert("Update fehlgeschlagen", error.localizedDescription) }
         }
     }
 
-    /// Lädt die Zip (iCloud: wartet bis zu 60 s auf die Synchronisierung) und prüft die Prüfsumme
+    /// Lädt die Zip von GitHub und prüft die Prüfsumme
     private static func loadZip(_ url: URL, expected: String, _ done: @escaping (Data?) -> Void) {
-        if url.isFileURL {
-            var tries = 0
-            func attempt() {
-                tries += 1
-                if !FileManager.default.fileExists(atPath: url.path) { try? FileManager.default.startDownloadingUbiquitousItem(at: url) }
-                if let d = try? Data(contentsOf: url), sha256(d) == expected { done(d); return }
-                if tries < 12 { DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: attempt) } else { done(nil) }
-            }
-            attempt()
-        } else {
-            URLSession.shared.dataTask(with: url) { d, _, _ in
-                DispatchQueue.main.async { done(d.flatMap { sha256($0) == expected ? $0 : nil }) }
-            }.resume()
-        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 120
+        URLSession.shared.dataTask(with: req) { d, _, _ in
+            DispatchQueue.main.async { done(d.flatMap { sha256($0) == expected ? $0 : nil }) }
+        }.resume()
     }
 
     static func sha256(_ d: Data) -> String { SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined() }

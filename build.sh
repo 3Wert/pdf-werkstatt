@@ -2,7 +2,7 @@
 # Baut PDF-Werkstatt.app und installiert nach ~/Applications.
 set -e
 cd "$(dirname "$0")"
-# Vor jedem Bau den Stand festhalten (Sicherung landet über den post-commit-Haken in iCloud Drive)
+# Vor jedem Bau den Stand festhalten; build.sh schiebt ihn danach zu GitHub
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
   git add -A && git commit -q -m "Automatischer Stand vor Build $(date '+%d.%m.%Y %H:%M')" && echo "Stand gesichert: $(git rev-parse --short HEAD)"
 fi
@@ -60,22 +60,24 @@ PL
 codesign --force -s - "$APP"
 rm -rf "$ZIEL"; mkdir -p "$HOME/Applications"; mv "$APP" "$ZIEL"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$ZIEL"
-# Fertige App als Zip in iCloud Drive + Update-Information (aktuell.json) für die Update-Prüfung
-OUT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Backups/PDFWerkstatt"
-mkdir -p "$OUT"
-ZIPNAME="PDF-Werkstatt-$VERSION-$BUILD.zip"
-ditto -c -k --keepParent "$ZIEL" "$OUT/$ZIPNAME"
-rm -f "$OUT/PDF-Werkstatt.zip"; cp "$OUT/$ZIPNAME" "$OUT/PDF-Werkstatt.zip"     # fester Name für Anleitungen
-ls -t "$OUT"/PDF-Werkstatt-*.zip | tail -n +4 | xargs rm -f 2>/dev/null || true   # nur die letzten drei behalten
-SHA=$(shasum -a 256 "$OUT/$ZIPNAME" | cut -d' ' -f1)
-# Änderungsliste: Zeilen unter der obersten Überschrift von CHANGES.md
-NOTES=$(awk '/^## /{n++; next} n==1 && /^- /{sub(/^- /,""); gsub(/"/,"\\\""); printf "%s\"%s\"", (c++?",":""), $0}' CHANGES.md 2>/dev/null)
-cat > "$OUT/aktuell.json" <<J
+# Release auf GitHub (öffentlich): Zip + aktuell.json; die App holt sich Updates von dort.
+# Ohne Release bauen: PDFW_NO_RELEASE=1 ./build.sh
+if [ -z "$PDFW_NO_RELEASE" ]; then
+  OUT="build/release"; rm -rf "$OUT"; mkdir -p "$OUT"
+  ZIPNAME="PDF-Werkstatt-$VERSION-$BUILD.zip"
+  ditto -c -k --keepParent "$ZIEL" "$OUT/$ZIPNAME"
+  cp "$OUT/$ZIPNAME" "$OUT/PDF-Werkstatt.zip"      # fester Name für die Anleitung
+  SHA=$(shasum -a 256 "$OUT/$ZIPNAME" | cut -d' ' -f1)
+  NOTES=$(awk '/^## /{n++; next} n==1 && /^- /{sub(/^- /,""); gsub(/"/,"\\\""); printf "%s\"%s\"", (c++?",":""), $0}' CHANGES.md 2>/dev/null)
+  cat > "$OUT/aktuell.json" <<J
 {"version":"$VERSION","build":"$BUILD","date":"$(date '+%d.%m.%Y')","file":"$ZIPNAME","sha256":"$SHA","notes":[$NOTES]}
 J
-echo "Update bereitgestellt: $ZIPNAME ($VERSION, Build $BUILD)"
-# Optional auch auf den Webserver (für Kollegen ohne iCloud): PDFW_WEB=vps:/opt/3wert-neu/html/pdf-werkstatt ./build.sh
-if [ -n "$PDFW_WEB" ]; then
-  scp -q "$OUT/$ZIPNAME" "$OUT/aktuell.json" "$PDFW_WEB/" && echo "Auch hochgeladen nach $PDFW_WEB"
+  awk '/^## /{n++; if(n>1) exit} n==1' CHANGES.md > "$OUT/notes.md" 2>/dev/null || echo "Version $VERSION" > "$OUT/notes.md"
+  git push -q origin HEAD 2>/dev/null || echo "Hinweis: Push fehlgeschlagen (offline?)"
+  if gh release create "v$VERSION-$BUILD" "$OUT/$ZIPNAME" "$OUT/PDF-Werkstatt.zip" "$OUT/aktuell.json" --title "PDF-Werkstatt $VERSION ($BUILD)" --notes-file "$OUT/notes.md" >/dev/null 2>&1; then
+    echo "Release veröffentlicht: v$VERSION-$BUILD → https://github.com/3Wert/pdf-werkstatt/releases/latest"
+  else
+    echo "Hinweis: Release nicht veröffentlicht (offline oder gh nicht angemeldet)"
+  fi
 fi
 echo "Installiert: $ZIEL"
