@@ -1221,7 +1221,10 @@ final class Canvas: PDFView, NSTextViewDelegate {
         let hx = src.best(vertical: true, candidates: xs, tolerance: tol)
         // Grundlinie hat Vorrang vor Rahmenkanten
         var hy: SnapSources.Hit? = nil
-        if let bl = baselineFromTop { hy = src.best(vertical: false, candidates: [(pr.maxY - bl, true)], tolerance: tol) }
+        if let bl = baselineFromTop {
+            hy = src.best(vertical: false, candidates: [(pr.maxY - bl, true)], tolerance: tol)
+            Log.v("snap Grundlinie: Kandidat \(pr.maxY - bl), Toleranz \(tol), Treffer \(hy.map { "\($0.line.kind.rawValue) \($0.line.value)" } ?? "keiner"), nächste Grundlinien: \(src.lines.filter { $0.kind == .baseline || $0.kind == .lineSpacing }.map { $0.value }.sorted { abs($0 - (pr.maxY - bl)) < abs($1 - (pr.maxY - bl)) }.prefix(3))")
+        }
         if hy == nil { hy = src.best(vertical: false, candidates: [(pr.minY, false), (pr.midY, false), (pr.maxY, false)], tolerance: tol) }
         if let h = hx { out.origin.x += h.delta }
         if let h = hy { out.origin.y += h.delta }

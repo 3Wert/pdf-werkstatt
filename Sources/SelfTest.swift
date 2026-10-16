@@ -185,13 +185,11 @@ enum SelfTest {
               let r = lb("Rechnung Nr.")!
               _ = c.selectContent(at: CGPoint(x: r.midX, y: r.midY), on: page())
               let before = c.contentSel!.bounds
+              let line = lb("Rechnung Nr.")!                     // exakte Zeilenmaße als Bezug
               let target = lb("Rechnungsdatum")!
-              let dx = (target.minX + 20 + 3) - before.minX     // 3 pt neben einer Kante … aber Kante liegt bei target.minX → testen mit kleiner Abweichung
-              _ = dx
-              c.tool = .editText
               let a = c.convert(c.convert(CGPoint(x: before.midX, y: before.midY), from: page()), to: nil)
               let s = c.scaleFactor
-              let b = CGPoint(x: a.x + (target.minX - before.minX + 3) * s, y: a.y)
+              let b = CGPoint(x: a.x + (target.minX - line.minX + 3) * s, y: a.y)
               for i in 1...5 { w.postEvent(mouse(.leftMouseDragged, w, CGPoint(x: a.x + (b.x - a.x) * CGFloat(i) / 5, y: a.y)), atStart: false) }
               w.postEvent(mouse(.leftMouseUp, w, b), atStart: false); w.sendEvent(mouse(.leftMouseDown, w, a))
               let after = lb("Rechnung Nr.")!
@@ -200,16 +198,16 @@ enum SelfTest {
               c.tool = .textSelect
               t1 = find("Rechnungsdatum: 16.10.2026")      // nach dem Inhalts-Eingriff sind alle Objekte neue Instanzen
               c.addCustomGuide(horizontal: false, atView: c.convert(CGPoint(x: 400, y: 500), from: page()))
-              let dx = (400 + 3) - t1.bounds.minX
+              let dx = (400 + 3) - (t1.bounds.minX + pad)      // Textkante 3 pt neben der Hilfslinie
               dragObject(c, t1, by: CGVector(dx: dx * c.scaleFactor, dy: 0))
-              note("Eigene Hilfslinie x=400: Feld 1 linke Kante \(String(format: "%.2f", t1.bounds.minX)) (400 = eingerastet), gespeichert: \(c.customGuides[0]?.x ?? [])") },
+              note("Eigene Hilfslinie x=400: Textkante \(String(format: "%.2f", t1.bounds.minX + pad)) (400 = eingerastet), gespeichert: \(c.customGuides[0]?.x ?? [])") },
             { // ⌘ gedrückt → kein Einrasten
               let a = c.convert(c.convert(CGPoint(x: t1.bounds.midX, y: t1.bounds.midY), from: page()), to: nil)
               let b = CGPoint(x: a.x - 3 * c.scaleFactor, y: a.y)
               let down = NSEvent.mouseEvent(with: .leftMouseDown, location: a, modifierFlags: [], timestamp: 0, windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
               for i in 1...4 { w.postEvent(NSEvent.mouseEvent(with: .leftMouseDragged, location: CGPoint(x: a.x + (b.x - a.x) * CGFloat(i) / 4, y: a.y), modifierFlags: [.command], timestamp: 0, windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!, atStart: false) }
               w.postEvent(mouse(.leftMouseUp, w, b), atStart: false); w.sendEvent(down)
-              note("mit ⌘ gezogen: linke Kante \(String(format: "%.2f", t1.bounds.minX)) (≈ 397 = nicht eingerastet)") },
+              note("mit ⌘ gezogen: Textkante \(String(format: "%.2f", t1.bounds.minX + pad)) (≈ 397 = nicht eingerastet)") },
             { GuideSettings.shared.showRulers = true; GuideSettings.shared.showGrid = true; wc.applyGuideSettings(); c.overlay.display()
               note("Lineale und Raster an, gezeichnet ohne Absturz") },
             { GuideSettings.shared = GuideSettings(); wc.applyGuideSettings() },
