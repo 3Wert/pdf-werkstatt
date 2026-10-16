@@ -985,11 +985,10 @@ final class Canvas: PDFView, NSTextViewDelegate {
             if !e.modifierFlags.contains(.command) {
                 var bl: CGFloat? = nil
                 var inset: CGFloat = 0
-                if let w = d.obj as? WObject, w.model.isText, w.model.rot == 0 { bl = d.startBounds.maxY - w.firstBaselineY; inset = pad }
+                if let w = d.obj as? WObject, w.model.isText, w.model.rot == 0 { bl = w.baselineFromTop; inset = pad }
                 r = snap(r, page: d.page, exclude: [d.obj].compactMap { $0 } + d.others.map { $0.0 }, baselineFromTop: bl, textInset: inset)
             }
             d.obj?.bounds = convert(r, to: d.page)
-            if let w = d.obj as? WObject, w.model.isText { Log.v("mouseDragged: bounds=\(w.bounds) Grundlinie \(w.firstBaselineY)") }
             let mdx = r.minX - d.startRect.minX, mdy = r.minY - d.startRect.minY
             for (o, b0, _) in d.others {
                 guard let op = o.page else { continue }
@@ -1088,7 +1087,6 @@ final class Canvas: PDFView, NSTextViewDelegate {
                 let nm = w.model, nb = w.bounds
                 w.model = sm; w.bounds = d.startBounds
                 setModel(w, nm, bounds: nb, action: name)
-                Log.v("finishDrag: nb=\(nb) nachher=\(w.bounds) Grundlinie \(w.firstBaselineY)")
             } else {
                 let nb = a.bounds
                 a.bounds = d.startBounds
@@ -1225,18 +1223,12 @@ final class Canvas: PDFView, NSTextViewDelegate {
         var hy: SnapSources.Hit? = nil
         if let bl = baselineFromTop {
             hy = src.best(vertical: false, candidates: [(pr.maxY - bl, true)], tolerance: tol)
-            let cand = pr.maxY - bl
-            let near: [CGFloat] = src.lines.filter { $0.kind == .baseline || $0.kind == .lineSpacing }.map { $0.value }.sorted { abs($0 - cand) < abs($1 - cand) }
-            let hitText: String = hy.map { "\($0.line.kind.rawValue) \($0.line.value)" } ?? "keiner"
-            Log.v("snap Grundlinie: Kandidat \(cand), Toleranz \(tol), Treffer \(hitText), nächste: \(Array(near.prefix(3)))")
         }
         if hy == nil { hy = src.best(vertical: false, candidates: [(pr.minY, false), (pr.midY, false), (pr.maxY, false)], tolerance: tol) }
         if let h = hx { out.origin.x += h.delta }
         if let h = hy { out.origin.y += h.delta }
         showGuides([hx, hy].compactMap { $0 }, page: page, around: out)
-        let back = convert(out, from: page)
-        Log.v("snap: r=\(r) pr=\(pr) out=\(out) back=\(back) zurück=\(convert(back, to: page))")
-        return back
+        return convert(out, from: page)
     }
 
     private func showGuides(_ hits: [SnapSources.Hit], page: PDFPage, around out: CGRect) {

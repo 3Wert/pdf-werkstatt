@@ -139,13 +139,14 @@ final class SnapSources {
 }
 
 extension WObject {
-    /// y der ersten Textgrundlinie (nur für ungedrehten Text sinnvoll)
-    var firstBaselineY: CGFloat {
+    /// Abstand von der Oberkante des Rahmens zur ersten Textgrundlinie – hängt nur von Schrift und Zeilenhöhe ab, nicht von der Lage
+    var baselineFromTop: CGFloat {
         let f = textFont
         let lh = model.lineHeight ?? ceil(f.ascender - f.descender + f.leading)
-        // Textzeichnung beginnt oben mit `pad`; Grundlinie der ersten Zeile = oben − pad − (lh − |descender|) … vereinfacht:
-        return bounds.maxY - pad - (model.lineHeight != nil ? (lh - (lh - f.ascender + f.descender) / 2) : f.ascender)
+        return pad + (model.lineHeight != nil ? (lh - (lh - f.ascender + f.descender) / 2) : f.ascender)
     }
+    /// y der ersten Textgrundlinie (nur für ungedrehten Text sinnvoll)
+    var firstBaselineY: CGFloat { bounds.maxY - baselineFromTop }
 }
 
 // MARK: - Eigene Hilfslinien je Dokument
