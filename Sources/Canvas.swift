@@ -989,6 +989,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
                 r = snap(r, page: d.page, exclude: [d.obj].compactMap { $0 } + d.others.map { $0.0 }, baselineFromTop: bl, textInset: inset)
             }
             d.obj?.bounds = convert(r, to: d.page)
+            if let w = d.obj as? WObject, w.model.isText { Log.v("mouseDragged: bounds=\(w.bounds) Grundlinie \(w.firstBaselineY)") }
             let mdx = r.minX - d.startRect.minX, mdy = r.minY - d.startRect.minY
             for (o, b0, _) in d.others {
                 guard let op = o.page else { continue }
@@ -1087,6 +1088,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
                 let nm = w.model, nb = w.bounds
                 w.model = sm; w.bounds = d.startBounds
                 setModel(w, nm, bounds: nb, action: name)
+                Log.v("finishDrag: nb=\(nb) nachher=\(w.bounds) Grundlinie \(w.firstBaselineY)")
             } else {
                 let nb = a.bounds
                 a.bounds = d.startBounds
