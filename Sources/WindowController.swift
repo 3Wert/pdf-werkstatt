@@ -242,7 +242,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
                         "Zuschneiden – Rahmen aufziehen, Enter schneidet zu",
                         "PDF-Inhalt bearbeiten – Klick wählt Text/Bild/Linie (⌫ löscht, Ziehen verschiebt), Doppelklick ändert Text",
                         "Abdecken – Rechteck über den Bereich ziehen", "Zeichnen (Freihand)",
-                        "Skizzieren – Linie, Pfeil, Rechteck, Oval werden erkannt", "Schwärzen – Rechteck ziehen"]
+                        "Skizzieren – Linie, Pfeil, Rechteck, Oval werden erkannt", "Schwärzen – Rechteck ziehen, danach Werkzeuge › Schwärzungen anwenden"]
             let g = NSToolbarItemGroup(itemIdentifier: id, images: modes.map { NSImage(systemSymbolName: $0.symbol, accessibilityDescription: $0.title)! },
                                        selectionMode: .selectOne, labels: modes.map { $0.title }, target: self, action: #selector(modePicked(_:)))
             g.label = "Werkzeug"
@@ -403,6 +403,59 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         vc.currentColor = canvas.styleModel.fill?.color
         vc.onPick = { [weak self] c in self?.canvas.applyColor(c, to: .fill); self?.refreshStyleItems() }
         show(vc, at: it)
+    }
+
+    // MARK: Schwärzen
+
+    @objc func applyRedactions(_ s: Any?) { _ = applyRedactions(confirm: true) }
+
+    /// Alle Schwärzungs-Markierungen anwenden. Liefert true, wenn angewendet wurde.
+    @discardableResult
+    func applyRedactions(confirm: Bool) -> Bool {
+        guard let w = window else { return false }
+        canvas.endEditing()
+        let marks = canvas.coverMarks(redact: true)
+        if marks.isEmpty {
+            let a = NSAlert()
+            a.messageText = "Keine Schwärzungen markiert"
+            a.informativeText = "Mit dem Werkzeug „Schwärzen“ Rechtecke über die Stellen ziehen oder Werkzeuge › Suchen und schwärzen … benutzen. Danach hier anwenden."
+            a.runModal()
+            return false
+        }
+        if confirm {
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = marks.count == 1 ? "Eine Schwärzung anwenden?" : "\(marks.count) Schwärzungen anwenden?"
+            a.informativeText = "Der Inhalt darunter wird endgültig aus der Datei entfernt: Text zeichenweise, Bilder pixelweise, Anmerkungen im Bereich. Die Datei wird ohne Altstände neu geschrieben. Widerrufen geht, solange das Dokument geöffnet ist."
+            a.addButton(withTitle: "Anwenden")
+            a.addButton(withTitle: "Abbrechen")
+            guard a.runModal() == .alertFirstButtonReturn else { return false }
+        }
+        let t0 = Date()
+        guard let rep = canvas.applyRedaction(marks, paint: true, removeAnnots: true, action: "Schwärzungen anwenden") else {
+            let a = NSAlert()
+            a.alertStyle = .critical
+            a.messageText = "Schwärzen nicht möglich"
+            a.informativeText = "Diese Datei lässt sich nicht direkt bearbeiten (verschlüsselt oder ungewöhnlich aufgebaut). Sicher ist der Export als Bild-PDF (Ablage › Exportieren)."
+            a.runModal()
+            return false
+        }
+        let a = NSAlert()
+        a.alertStyle = rep.leaks.isEmpty ? .informational : .critical
+        a.messageText = rep.leaks.isEmpty ? (marks.count == 1 ? "Schwärzung angewendet" : "\(marks.count) Schwärzungen angewendet") : "Text noch auffindbar"
+        var lines = ["Entfernt: \(rep.summary)."]
+        if rep.leaks.isEmpty { lines.append("Prüfung: In den geschwärzten Bereichen ist kein Text mehr auffindbar; die Datei wurde ohne Altstände neu geschrieben.") }
+        else { lines.append("⚠️ " + rep.leaks.joined(separator: "; ") + " – bitte als Bild-PDF exportieren.") }
+        if !rep.notes.isEmpty { lines.append(rep.notes.joined(separator: "\n")) }
+        lines.append("\(Int(Date().timeIntervalSince(t0) * 1000)) ms")
+        a.informativeText = lines.joined(separator: "\n")
+        a.beginSheetModal(for: w)
+        return rep.leaks.isEmpty
+    }
+
+    @objc func searchAndRedact(_ s: Any?) {
+        guard let w = window else { return }
+        Dialogs.searchAndRedact(window: w, controller: self)
     }
 
     // MARK: Teilen

@@ -16,6 +16,12 @@ enum DrawMode {
         defer { isFull = old }
         return try f()
     }
+    /// Bildschirmdarstellung (Overlay): noch nicht angewendete Schwärzungen zeigen durchscheinend, was darunter liegt
+    private static let screenKey = "pdfw.onScreen"
+    static var onScreen: Bool {
+        get { Thread.current.threadDictionary[screenKey] as? Bool ?? false }
+        set { Thread.current.threadDictionary[screenKey] = newValue }
+    }
 }
 
 /// Schlüssel, unter dem die bearbeitbaren Daten eines Objekts im PDF liegen.
@@ -55,11 +61,12 @@ struct ObjModel: Codable, Equatable {
     var dash = false
     var shadow = false
     var origFont: String? = nil          // Schrift im PDF, falls sie auf dem Mac fehlt
+    var redact: Bool? = nil              // Abdeckung ist eine Schwärzungs-Markierung: Inhalt darunter wird beim Anwenden entfernt
 
     init(kind: ObjKind) { self.kind = kind }
 
     enum CodingKeys: String, CodingKey {
-        case id, kind, text, fontName, fontSize, textColor, align, autoWidth, lineHeight, stroke, fill, lineWidth, strokes, image, format, startNumber, firstPage, rot, dash, shadow, origFont
+        case id, kind, text, fontName, fontSize, textColor, align, autoWidth, lineHeight, stroke, fill, lineWidth, strokes, image, format, startNumber, firstPage, rot, dash, shadow, origFont, redact
     }
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
@@ -84,7 +91,9 @@ struct ObjModel: Codable, Equatable {
         dash = try c.decodeIfPresent(Bool.self, forKey: .dash) ?? false
         shadow = try c.decodeIfPresent(Bool.self, forKey: .shadow) ?? false
         origFont = try c.decodeIfPresent(String.self, forKey: .origFont)
+        redact = try c.decodeIfPresent(Bool.self, forKey: .redact)
     }
+    var isRedaction: Bool { kind == .cover && redact == true }
 
     var isText: Bool { kind == .text || kind == .pageNumber }
     var isLine: Bool { kind == .line || kind == .arrow }
@@ -294,7 +303,14 @@ final class WObject: PDFAnnotation {
             }
             (displayText as NSString).draw(in: r.insetBy(dx: pad, dy: pad), withAttributes: attributes())
         case .cover:
-            (model.fill ?? RGBA(.white)).color.setFill(); r.fill()
+            if model.isRedaction && DrawMode.onScreen {
+                // Markierung, noch nicht angewendet: Inhalt bleibt erkennbar, roter Rand
+                (model.fill ?? RGBA(.black)).color.withAlphaComponent(0.35).setFill(); r.fill()
+                NSColor(srgbRed: 0.85, green: 0.1, blue: 0.1, alpha: 1).setStroke()
+                let p = NSBezierPath(rect: r.insetBy(dx: 0.5, dy: 0.5)); p.lineWidth = 1; p.stroke()
+            } else {
+                (model.fill ?? RGBA(.white)).color.setFill(); r.fill()
+            }
         case .rect, .ellipse, .roundRect, .bubble, .star, .polygon:
             let rr = r.insetBy(dx: lw / 2 + (model.shadow ? 3 : 0), dy: lw / 2 + (model.shadow ? 3 : 0))
             let p = WObject.shapePath(model.kind, in: rr)

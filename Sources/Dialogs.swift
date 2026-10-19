@@ -48,6 +48,69 @@ enum Dialogs {
         return a.runModal() == .alertFirstButtonReturn ? f.stringValue : nil
     }
 
+    // MARK: Suchen und schwärzen
+
+    static func searchAndRedact(window: NSWindow, controller wc: MainWindowController) {
+        let canvas = wc.canvas
+        guard let doc = canvas.document else { return }
+        let a = NSAlert()
+        a.messageText = "Suchen und schwärzen"
+        a.informativeText = "Alle Treffer im Dokument werden als Schwärzungen markiert. Danach prüfen und mit „Schwärzungen anwenden“ endgültig entfernen."
+        let preset = NSPopUpButton()
+        preset.addItems(withTitles: RedactPatterns.presets.map { $0.0 })
+        let field = NSTextField(string: "")
+        field.placeholderString = "Text oder regulärer Ausdruck"
+        field.frame = NSRect(x: 0, y: 0, width: 300, height: 24)
+        let caseCheck = NSButton(checkboxWithTitle: "Groß-/Kleinschreibung beachten", target: nil, action: nil)
+        let regexCheck = NSButton(checkboxWithTitle: "Regulärer Ausdruck", target: nil, action: nil)
+        let hint = lbl("")
+        hint.font = NSFont.systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor
+        let handler = PresetHandler { idx in
+            let p = RedactPatterns.presets[idx]
+            if !p.1.isEmpty { field.stringValue = p.1; regexCheck.state = .on; caseCheck.state = .on; field.isEditable = false; hint.stringValue = "Vorgabe – findet typische Schreibweisen" }
+            else { field.stringValue = ""; regexCheck.state = .off; caseCheck.state = .off; field.isEditable = true; hint.stringValue = "" }
+        }
+        preset.target = handler; preset.action = #selector(PresetHandler.changed(_:))
+        let g = grid([[lbl("Suchen nach:"), preset], [lbl("Text:"), field], [NSView(), caseCheck], [NSView(), regexCheck], [NSView(), hint]])
+        g.frame = NSRect(x: 0, y: 0, width: 420, height: 150)
+        a.accessoryView = g
+        a.addButton(withTitle: "Markieren")
+        a.addButton(withTitle: "Markieren und anwenden")
+        a.addButton(withTitle: "Abbrechen")
+        a.window.initialFirstResponder = field
+        let r = a.runModal()
+        _ = handler
+        guard r != .alertThirdButtonReturn else { return }
+        let hits = RedactPatterns.find(in: doc, pattern: field.stringValue, isRegex: regexCheck.state == .on, caseSensitive: caseCheck.state == .on)
+        guard !hits.isEmpty else {
+            let n = NSAlert(); n.messageText = "Keine Treffer"; n.informativeText = "Nichts gefunden für „\(field.stringValue)“. Bei gescannten Seiten ohne Textebene hilft nur das Schwärzen-Werkzeug von Hand."
+            n.runModal(); return
+        }
+        canvas.um?.beginUndoGrouping()
+        for h in hits {
+            guard let p = doc.page(at: h.page) else { continue }
+            var m = Defaults.newModel(.cover)
+            m.fill = RGBA(.black); m.redact = true
+            canvas.add(WObject(model: m, bounds: h.rect), to: p)
+        }
+        canvas.um?.safeActionName("Suchen und schwärzen")
+        canvas.um?.endUndoGrouping()
+        canvas.wdoc?.touch()
+        canvas.overlay.needsDisplay = true
+        if r == .alertSecondButtonReturn { wc.applyRedactions(confirm: false); return }
+        let pages = Set(hits.map { $0.page }).count
+        let n = NSAlert()
+        n.messageText = hits.count == 1 ? "Eine Stelle markiert" : "\(hits.count) Stellen markiert"
+        n.informativeText = "Auf \(pages) Seite\(pages == 1 ? "" : "n"). Die Markierungen prüfen (rot umrandet), dann Werkzeuge › Schwärzungen anwenden."
+        n.beginSheetModal(for: window)
+    }
+
+    private final class PresetHandler: NSObject {
+        let f: (Int) -> Void
+        init(_ f: @escaping (Int) -> Void) { self.f = f }
+        @objc func changed(_ p: NSPopUpButton) { f(p.indexOfSelectedItem) }
+    }
+
     // MARK: Seitenzahlen
 
     static func pageNumbers(window: NSWindow, canvas: Canvas) {

@@ -239,6 +239,39 @@ final class WDocument: NSDocument {
         Log.w("replaceData \(action): \(new.count) Bytes, Seite \(idx)")
     }
 
+    /// Dokument ohne Widerrufen-Eintrag auf einen Stand zurücksetzen (nach einem fehlgeschlagenen Eingriff)
+    func restore(_ data: Data) {
+        guard let d = PDFDocument(data: data) else { return }
+        hydrate(document: d)
+        let idx = controller?.canvas.currentPage.map { pdf.index(for: $0) } ?? 0
+        pdf = d
+        controller?.documentReplaced(pageIndex: idx)
+    }
+
+    // MARK: Sichern mit offenen Schwärzungen
+
+    /// true = weitermachen, false = abgebrochen
+    private func confirmPendingRedactions() -> Bool {
+        guard let c = controller else { return true }
+        let red = c.canvas.coverMarks(redact: true)
+        guard !red.isEmpty else { return true }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = red.count == 1 ? "Eine Schwärzung ist noch nicht angewendet" : "\(red.count) Schwärzungen sind noch nicht angewendet"
+        a.informativeText = "Beim Sichern bleiben sie Markierungen: Der Inhalt darunter steht weiter in der Datei. Angewendet werden sie endgültig entfernt."
+        a.addButton(withTitle: "Anwenden und sichern")
+        a.addButton(withTitle: "Nur Markierungen sichern")
+        a.addButton(withTitle: "Abbrechen")
+        switch a.runModal() {
+        case .alertFirstButtonReturn: return c.applyRedactions(confirm: false)
+        case .alertSecondButtonReturn: return true
+        default: return false
+        }
+    }
+
+    override func save(_ sender: Any?) { if confirmPendingRedactions() { super.save(sender) } }
+    override func saveAs(_ sender: Any?) { if confirmPendingRedactions() { super.saveAs(sender) } }
+
     static func openNew(with pdf: PDFDocument, name: String? = nil) {
         let d = WDocument()
         hydrate(document: pdf)

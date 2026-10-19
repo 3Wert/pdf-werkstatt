@@ -14,8 +14,56 @@ extension Canvas {
 /// Selbsttest: PDFW_SELFTEST=<Ordner> – bearbeitet das erste Dokument per Skript, macht Fensterbilder und speichert.
 enum SelfTest {
     static func runIfRequested() {
+        if let dir = ProcessInfo.processInfo.environment["PDFW_REDACT_UITEST"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { redactUI(dir) }
+            return
+        }
         guard let dir = ProcessInfo.processInfo.environment["PDFW_SELFTEST"] else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { step(dir) }
+    }
+
+    /// PDFW_REDACT_UITEST=<Ordner> datei.pdf – Schwärzen über die Oberfläche: markieren, anwenden, Abdeckung leeren, widerrufen, sichern
+    static func redactUI(_ dir: String) {
+        guard let doc = NSDocumentController.shared.documents.first as? WDocument, let wc = doc.controller, let w = wc.window else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+        let c = wc.canvas
+        func page() -> PDFPage { doc.pdf.page(at: 0)! }
+        func found(_ t: String) -> Bool { !doc.pdf.findString(t, withOptions: [.caseInsensitive]).isEmpty }
+        func closeSheet() { if let s = w.attachedSheet { w.endSheet(s) } }
+        run([
+            { c.go(to: PDFDestination(page: page(), at: CGPoint(x: 0, y: 800)))
+              var hits = RedactPatterns.find(in: doc.pdf, pattern: #"DE89\s?3704\s?0044\s?0532\s?0130\s?00"#, isRegex: true, caseSensitive: false)
+              hits += RedactPatterns.find(in: doc.pdf, pattern: "Mustermann", isRegex: false, caseSensitive: false)
+              for h in hits { guard let p = doc.pdf.page(at: h.page) else { continue }
+                  var m = Defaults.newModel(.cover); m.fill = RGBA(.black); m.redact = true
+                  c.add(WObject(model: m, bounds: h.rect), to: p, action: "Schwärzen") }
+              note("Markiert: \(c.coverMarks(redact: true).count) Schwärzungen aus \(hits.count) Treffern") },
+            { c.overlay.display(); shot(wc, dir + "/schwaerzen-1-markiert.png")
+              // dazu eine weiße Abdeckung über den Betrag
+              if let sel = doc.pdf.findString("1.234,56", withOptions: []).first, let p = sel.pages.first {
+                  var m = Defaults.newModel(.cover); m.fill = RGBA(.white)
+                  c.add(WObject(model: m, bounds: sel.bounds(for: p).insetBy(dx: -1, dy: -1)), to: p, action: "Abdecken") }
+              note("Abdeckungen (weiß): \(c.coverMarks(redact: false).count)") },
+            { let ok = wc.applyRedactions(confirm: false); note("Anwenden: \(ok ? "ok" : "FEHLER")") },
+            { closeSheet(); c.overlay.display(); shot(wc, dir + "/schwaerzen-2-angewendet.png")
+              note("nach Anwenden: Schwärzungen \(c.coverMarks(redact: true).count) (0 erwartet), Abdeckungen \(c.coverMarks(redact: false).count) (1 erwartet), 'Mustermann' auffindbar: \(found("Mustermann")) (false erwartet), 'DE89' auffindbar: \(found("DE89")) (false erwartet), 'Leverkusen' auffindbar: \(found("Leverkusen")) (true erwartet)") },
+            { let white = c.coverMarks(redact: false)
+              let rep = c.applyRedaction(white, paint: false, removeAnnots: false, action: "Inhalt unter Abdeckung entfernen")
+              note("Abdeckung geleert: \(rep?.summary ?? "FEHLER") · Abdeckung noch da: \(c.coverMarks(redact: false).count) (1 erwartet) · '1.234,56' auffindbar: \(found("1.234,56")) (false erwartet) · 'zahlbar' auffindbar: \(found("zahlbar")) (true erwartet)") },
+            { w.makeFirstResponder(c); note("vor Widerrufen: canUndo=\(doc.undoManager?.canUndo ?? false) „\(doc.undoManager?.undoMenuItemTitle ?? "")“ Gruppen offen: \(doc.undoManager?.groupingLevel ?? -1)")
+              doc.undoManager?.undo() },
+            { note("nach 1. Widerrufen: „\(doc.undoManager?.undoMenuItemTitle ?? "")“ Abdeckung: \(c.coverMarks(redact: false).count), '1.234,56': \(found("1.234,56"))")
+              doc.undoManager?.undo() },
+            { c.overlay.display(); shot(wc, dir + "/schwaerzen-3-widerrufen.png")
+              note("nach 2× Widerrufen: Schwärzungen \(c.coverMarks(redact: true).count) (3 erwartet), 'Mustermann' auffindbar: \(found("Mustermann")) (true erwartet), '1.234,56': \(found("1.234,56")) (true erwartet)") },
+            { let ok = wc.applyRedactions(confirm: false); note("erneut anwenden: \(ok ? "ok" : "FEHLER")") },
+            { closeSheet()
+              guard let data = try? doc.data(ofType: "com.adobe.pdf"), let d = PDFDocument(data: data) else { note("Sichern: FEHLER"); return }
+              let eof = data.ranges(of: "%%EOF".data(using: .utf8)!).count
+              try? data.write(to: URL(fileURLWithPath: dir + "/schwaerzen-gesichert.pdf"))
+              note("gesichert: \(data.count / 1024) KB, EOF=\(eof) (1 erwartet), 'Mustermann' auffindbar: \(!d.findString("Mustermann", withOptions: []).isEmpty) (false erwartet), 'DE89': \(!d.findString("DE89", withOptions: []).isEmpty) (false erwartet), Seiten: \(d.pageCount)") },
+        ]) { finish(dir) }
     }
 
     static func shot(_ wc: MainWindowController, _ path: String) {

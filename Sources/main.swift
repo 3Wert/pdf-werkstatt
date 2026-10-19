@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.trim()
         Log.w("--- Start \(Bundle.main.infoDictionary?["CFBundleVersion"] ?? "") ---")
         UndoStore.purge()
+        RedactTest.runIfRequested()
         Updater.start()
         SelfTest.runIfRequested()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
@@ -190,6 +191,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(annM, "Schwärzen", #selector(MainWindowController.selectTool(_:)), "", tag: Tool.redact.rawValue)
         ann.submenu = annM
         tools.addItem(ann)
+        add(tools, "Suchen und schwärzen …", #selector(MainWindowController.searchAndRedact(_:)), "f", [.command, .option])
+        add(tools, "Schwärzungen anwenden …", #selector(MainWindowController.applyRedactions(_:)), "r", [.command, .shift])
         let sig = NSMenuItem(title: "Unterschreiben", action: nil, keyEquivalent: "")
         let sigM = NSMenu()
         add(sigM, "Gespeicherte Unterschrift einsetzen", #selector(MainWindowController.insertSavedSignature(_:)))

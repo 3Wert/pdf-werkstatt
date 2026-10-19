@@ -236,26 +236,78 @@ final class Canvas: PDFView, NSTextViewDelegate {
         return applyContent(m, ks.map { .remove($0) }, action: "Text bearbeiten")
     }
 
-    /// Vor dem Versenden: Inhalt unter Abdeckungen/Schwärzungen wirklich entfernen.
-    /// Liefert (entfernt, nur teilweise abgedeckt).
-    func removeContentUnderCovers() -> (Int, Int) {
-        guard let d = document else { return (0, 0) }
-        let covers = SendCheck.covers(d)
-        var removed = 0, partial = 0
-        um?.beginUndoGrouping()
-        for pageIdx in Set(covers.map { $0.0 }).sorted() {
-            guard let page = document?.page(at: pageIdx), let m = contentModel(for: page) else { continue }
-            let rects = covers.filter { $0.0 == pageIdx }.map { $0.1.insetBy(dx: -0.5, dy: -0.5) }
-            var ks: [Int] = []
-            for k in m.elements.indices {
-                let c = rects.map { m.coverage(k, by: $0) }.max() ?? 0
-                if c >= 0.6 { ks.append(k) } else if c > 0.05 { partial += 1 }
-            }
-            if !ks.isEmpty, applyContent(m, ks.map { .remove($0) }, action: "Inhalt unter Abdeckung entfernen") { removed += ks.count }
+    // MARK: Schwärzen
+
+    /// Alle Abdeckungen des Dokuments: `redact` = Schwärzungs-Markierungen, sonst einfache Abdeckungen
+    func coverMarks(redact: Bool) -> [(WObject, Int)] {
+        guard let d = document else { return [] }
+        var out: [(WObject, Int)] = []
+        for i in 0..<d.pageCount {
+            guard let p = d.page(at: i) else { continue }
+            for case let w as WObject in p.annotations where w.model.kind == .cover && w.model.isRedaction == redact { out.append((w, i)) }
         }
-        um?.safeActionName("Inhalt unter Abdeckung entfernen")
-        um?.endUndoGrouping()
-        return (removed, partial)
+        return out
+    }
+
+    /// Inhalt unter Markierungen endgültig entfernen (Text zeichenweise, Bilder pixelweise, Datei ohne Altstände).
+    /// `paint`: Markierungen als Flächen in die Seite zeichnen und die Markierungsobjekte entfernen.
+    /// `removeAnnots`: fremde Anmerkungen im Bereich löschen. Ein Widerrufen-Schritt.
+    func applyRedaction(_ objs: [(WObject, Int)], paint: Bool, removeAnnots: Bool, action: String) -> RedactReport? {
+        guard !objs.isEmpty, let d = wdoc, let doc = document else { return nil }
+        endEditing(); select(nil)
+        d.touch()                                   // frischer Stand – der Zwischenspeicher könnte von vor den Markierungen sein
+        guard let old = d.currentData() else { return nil }
+        let marks = objs.map { RedactMark(pageIndex: $0.1, rect: $0.0.bounds, color: $0.0.model.fill ?? RGBA(.black)) }
+        var annots = 0
+        if removeAnnots {
+            for idx in Set(marks.map { $0.pageIndex }) {
+                guard let p = doc.page(at: idx) else { continue }
+                let rects = marks.filter { $0.pageIndex == idx }.map { $0.rect }
+                for a in p.annotations where (a as? WObject)?.model.isRedaction != true {
+                    let b = a.bounds
+                    guard b.width > 0, b.height > 0 else { continue }
+                    let covered = rects.map { r -> CGFloat in let i = r.intersection(b); return i.isNull ? 0 : i.width * i.height }.max() ?? 0
+                    if covered >= 0.2 * b.width * b.height { p.removeAnnotation(a); annots += 1 }
+                }
+            }
+        }
+        if paint { for (w, i) in objs { doc.page(at: i)?.removeAnnotation(w) } }
+        d.touch()
+        guard let fresh = d.currentData() else { d.restore(old); return nil }
+        var red = Redactor(marks: marks)
+        guard var out = red.apply(to: fresh, paintBoxes: paint) else {
+            Log.w("Schwärzen fehlgeschlagen: \(red.report.notes.joined(separator: "; "))")
+            d.restore(old); return nil
+        }
+        var report = red.report
+        func leaks(_ data: Data) -> [String] {
+            guard let check = PDFDocument(data: data) else { return ["Ergebnis nicht lesbar"] }
+            var out: [String] = []
+            for m in marks {
+                if let p = check.page(at: m.pageIndex), let s = p.selection(for: m.rect.insetBy(dx: 1, dy: 1))?.string?.trimmed, !s.isEmpty {
+                    out.append("Seite \(m.pageIndex + 1): „\(s.prefix(40))“")
+                }
+            }
+            return out
+        }
+        var found = leaks(out)
+        if !found.isEmpty {
+            // Letzte Stufe: betroffene Seiten als Bild
+            Log.w("Schwärzen: Text noch auffindbar (\(found.joined(separator: "; "))) – Seiten werden als Bild geschrieben")
+            red = Redactor(marks: marks, forceRaster: true)
+            if let out2 = red.apply(to: fresh, paintBoxes: paint) {
+                out = out2; report = red.report
+                found = leaks(out)
+            }
+        }
+        report.leaks = found
+        report.annotationsRemoved = annots
+        let diffs = red.checkAppearance(before: fresh, after: out)
+        for (p, n) in diffs.sorted(by: { $0.key < $1.key }) where n > 60 { report.notes.append("Seite \(p + 1): Darstellung außerhalb der Schwärzung weicht an \(n) Pixeln ab") }
+        d.replaceData(out, old: old, action: action)
+        contentCache.removeAll()
+        Log.w("Schwärzen (\(action)): \(report.summary)\(report.leaks.isEmpty ? "" : " ⚠️ " + report.leaks.joined(separator: "; "))")
+        return report
     }
     private var loupePoint: CGPoint?
 
@@ -838,6 +890,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             select(nil)
             var m = Defaults.newModel(.cover)
             m.fill = RGBA(tool == .redact ? .black : .white)
+            if tool == .redact { m.redact = true }
             let w = WObject(model: m, bounds: CGRect(origin: pp, size: CGSize(width: 1, height: 1)))
             page.addAnnotation(w)
             drag = DragState(mode: .create, page: page, startView: vp, startRect: .zero, startBounds: w.bounds, startModel: nil, obj: w)
@@ -1847,6 +1900,10 @@ final class Canvas: PDFView, NSTextViewDelegate {
         if let w = a as? WObject, w.model.kind == .text {
             m.addItem(withTitle: "Text bearbeiten", action: #selector(editSelectedText(_:)), keyEquivalent: "").target = self
         }
+        if let w = a as? WObject, w.model.isRedaction {
+            m.addItem(withTitle: "Schwärzungen anwenden …", action: #selector(MainWindowController.applyRedactions(_:)), keyEquivalent: "")
+            m.addItem(.separator())
+        }
         if a is WObject {
             m.addItem(withTitle: "Kopieren", action: #selector(copy(_:)), keyEquivalent: "").target = self
             m.addItem(withTitle: "Duplizieren", action: #selector(duplicateObject(_:)), keyEquivalent: "").target = self
@@ -2095,6 +2152,8 @@ final class Canvas: PDFView, NSTextViewDelegate {
             // In Datei-Reihenfolge: eigene Objekte zeichnen; fremde Anmerkungen (Hervorhebungen), die in der Datei darüber
             // liegen, dort nachzeichnen, wo ein deckendes eigenes Objekt sie sonst verbergen würde
             var opaque: [CGRect] = []
+            DrawMode.onScreen = true
+            defer { DrawMode.onScreen = false }
             for a in anns {
                 if let w = a as? WObject {
                     guard !w.editing, w.shouldDisplay else { continue }

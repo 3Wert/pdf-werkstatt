@@ -471,7 +471,7 @@ final class PDFFile {
     }
 
     /// Alle Objekte, die von `o` aus erreichbar sind (ohne /Parent – sonst hängt der ganze Seitenbaum dran)
-    func closure(of o: PDFObj) -> Set<Int> {
+    func closure(of o: PDFObj, followParent: Bool = false) -> Set<Int> {
         var out = Set<Int>()
         var stack: [PDFObj] = [o]
         while let x = stack.popLast() {
@@ -479,12 +479,18 @@ final class PDFFile {
             case .ref(let n, _):
                 if out.insert(n).inserted, let obj = object(n) { stack.append(obj) }
             case .array(let a): stack += a
-            case .dict(let d): for (k, v) in d where k != "Parent" { stack.append(v) }
-            case .stream(let d, _): for (k, v) in d where k != "Parent" { stack.append(v) }
+            case .dict(let d): for (k, v) in d where followParent || k != "Parent" { stack.append(v) }
+            case .stream(let d, _): for (k, v) in d where followParent || k != "Parent" { stack.append(v) }
             default: break
             }
         }
         return out
+    }
+
+    /// Schriftwörterbuch zu einem Ressourcennamen (/F1 …)
+    func fontDict(_ name: String, resources: [String: PDFObj]) -> [String: PDFObj]? {
+        guard let fonts = resolve(resources["Font"] ?? .null).dictValue, let f = fonts[name] else { return nil }
+        return resolve(f).dictValue
     }
 
     /// Kleines eigenständiges PDF: eine Seite pro Inhalt, alle mit den Ressourcen der Originalseite.
@@ -525,10 +531,14 @@ final class PDFFile {
 
     /// Neue Datei: Seite `num` bekommt den Inhalt `content` (unkomprimiert). Alles andere bleibt.
     func updated(page num: Int, content: [UInt8], extra: [String: PDFObj] = [:]) -> Data? {
-        guard var pd = object(num)?.dictValue else { return nil }
-        for (k, v) in extra { pd[k] = v }
-        let newNum = maxObj + 1
-        pd["Contents"] = .ref(newNum, 0)
+        updated(pages: [num: (content, extra)], newObjects: [])
+    }
+
+    /// Erste freie Objektnummer für neue Objekte (`updated(pages:newObjects:)` nummeriert Inhaltsströme dahinter)
+    var firstFreeObject: Int { maxObj + 1 }
+
+    /// Inkrementelle Aktualisierung mehrerer Seiten plus beliebige neue Objekte (Nummern ab `firstFreeObject`, vom Aufrufer vergeben).
+    func updated(pages: [Int: (content: [UInt8], extra: [String: PDFObj])], newObjects: [(Int, PDFObj)]) -> Data? {
         var out = bytes
         if out.last != 0x0A { out.append(0x0A) }
         var newOffsets: [(Int, Int)] = []
@@ -538,8 +548,16 @@ final class PDFFile {
             out += PDFWriter.serialize(o)
             out += Array("\nendobj\n".utf8)
         }
-        emit(newNum, .stream([:], content))
-        emit(num, .dict(pd))
+        var next = max(maxObj, newObjects.map { $0.0 }.max() ?? 0) + 1
+        for (n, o) in newObjects { emit(n, o) }
+        for (num, up) in pages.sorted(by: { $0.key < $1.key }) {
+            guard var pd = object(num)?.dictValue else { return nil }
+            for (k, v) in up.extra { pd[k] = v }
+            let cn = next; next += 1
+            pd["Contents"] = .ref(cn, 0)
+            emit(cn, .stream([:], up.content))
+            emit(num, .dict(pd))
+        }
         let xrefPos = out.count
         out += Array("xref\n".utf8)
         for (n, off) in newOffsets.sorted(by: { $0.0 < $1.0 }) {
@@ -548,11 +566,40 @@ final class PDFFile {
         }
         var tr: [String: PDFObj] = [:]
         for k in ["Root", "Info", "ID"] { if let v = trailer[k] { tr[k] = v } }
-        tr["Size"] = .int(newNum + 1)
+        tr["Size"] = .int(next)
         tr["Prev"] = .int(startXref)
         out += Array("trailer\n".utf8)
         out += PDFWriter.serialize(.dict(tr))
         out += Array("\nstartxref\n\(xrefPos)\n%%EOF\n".utf8)
+        return Data(out)
+    }
+
+    /// Datei neu schreiben: nur noch erreichbare Objekte in ihrer aktuellen Fassung, eine xref-Tabelle, keine Altstände.
+    /// Damit verschwinden frühere Inhaltsströme (z. B. vor einer Schwärzung) wirklich aus der Datei.
+    func compacted() -> Data? {
+        var roots: [String: PDFObj] = [:]
+        for k in ["Root", "Info"] { if let v = trailer[k] { roots[k] = v } }
+        guard roots["Root"] != nil else { return nil }
+        let objs = closure(of: .dict(roots), followParent: true).sorted()
+        var out = Array("%PDF-1.7\n%\u{00E2}\u{00E3}\u{00CF}\u{00D3}\n".utf8)
+        var offs: [Int: Int] = [:]
+        for n in objs {
+            guard let o = object(n) else { continue }
+            offs[n] = out.count
+            out += Array("\(n) 0 obj\n".utf8); out += PDFWriter.serialize(o); out += Array("\nendobj\n".utf8)
+        }
+        let size = (offs.keys.max() ?? 0) + 1
+        let xref = out.count
+        out += Array("xref\n0 \(size)\n".utf8)
+        for n in 0..<size {
+            if let off = offs[n] { out += Array(String(format: "%010d 00000 n \n", off).utf8) }
+            else { out += Array("0000000000 65535 f \n".utf8) }
+        }
+        var tr = roots
+        tr["Size"] = .int(size)
+        if let id = trailer["ID"] { tr["ID"] = id }
+        out += Array("trailer\n".utf8); out += PDFWriter.serialize(.dict(tr))
+        out += Array("\nstartxref\n\(xref)\n%%EOF\n".utf8)
         return Data(out)
     }
 }
@@ -576,6 +623,7 @@ struct ContentElement {
     var textState: TextState?       // Zustand vor dem Element (für Verschieben)
     var bounds: CGRect = .null      // Seitenkoordinaten, später per Rendern bestimmt
     var name: String                // z. B. Bildname oder Textauszug
+    var ctm = CGAffineTransform.identity   // Transformation (cm-Stapel) an der Stelle des Elements
 }
 
 struct TextState {
@@ -597,6 +645,9 @@ func fmt(_ d: CGFloat) -> String { fmt(Double(d)) }
 final class ContentStream {
     private(set) var tokens: [CToken] = []
     private(set) var elements: [ContentElement] = []
+    /// Am Ende des Stroms noch offene q-Zustände bzw. ein offener Textblock – wer etwas anhängt, muss sie erst schließen
+    private(set) var openStates = 0
+    private(set) var endsInText = false
 
     static let paintOps: Set<String> = ["S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n"]
     static let pathOps: Set<String> = ["m", "l", "c", "v", "y", "h", "re"]
@@ -636,6 +687,8 @@ final class ContentStream {
         var inText = false
         var ts = TextState()
         var tsStack: [TextState] = []
+        var ctm = CGAffineTransform.identity
+        var ctmStack: [CGAffineTransform] = []
         var operandStart = 0
         var pathStart: Int? = nil
         var hasClip = false
@@ -653,15 +706,20 @@ final class ContentStream {
         for (idx, t) in tokens.enumerated() {
             guard let op = t.op else { continue }
             let operands = operandStart..<idx
-            defer { operandStart = idx + 1 }
+            let countBefore = elements.count
+            defer { operandStart = idx + 1; if elements.count > countBefore { elements[elements.count - 1].ctm = ctm } }
             if inText, pendingTextElem != nil, !["Tf", "Tc", "Tw", "Tz", "TL", "Ts", "Tr", "rg", "RG", "g", "G", "k", "K", "cs", "CS", "sc", "scn", "SC", "SCN", "gs"].contains(op) {
                 finishPendingText(nextOp: op)
             }
             switch op {
             case "BT": inText = true; ts.tlm = .identity; lastTextOpWasPos = true
             case "ET": inText = false; pendingTextElem = nil
-            case "q": tsStack.append(ts)
-            case "Q": if let s = tsStack.popLast() { ts = s }
+            case "q": tsStack.append(ts); ctmStack.append(ctm)
+            case "Q": if let s = tsStack.popLast() { ts = s }; if let c = ctmStack.popLast() { ctm = c }
+            case "cm":
+                if operands.count >= 6 {
+                    ctm = CGAffineTransform(a: num(operands, 0), b: num(operands, 1), c: num(operands, 2), d: num(operands, 3), tx: num(operands, 4), ty: num(operands, 5)).concatenating(ctm)
+                }
             case "Tf":
                 if operands.count >= 2 { ts.font = tokens[operands.lowerBound].obj; ts.size = tokens[operands.lowerBound + 1].obj.doubleValue ?? 0 }
             case "Tc": ts.tc = num(operands, 0)
@@ -705,6 +763,8 @@ final class ContentStream {
             }
         }
         if pendingTextElem != nil { finishPendingText(nextOp: "ET") }
+        openStates = ctmStack.count
+        endsInText = inText
     }
 
     private func num(_ r: Range<Int>, _ k: Int) -> Double {

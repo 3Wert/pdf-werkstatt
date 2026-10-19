@@ -76,7 +76,7 @@ enum Recovery {
     }
 }
 
-/// Prüfung vor dem Versenden: abgedeckte/geschwärzte Stellen enthalten den Inhalt darunter noch.
+/// Prüfung vor dem Versenden: Schwärzungen anwenden, Abdeckungen auf Wunsch leeren.
 enum SendCheck {
     enum Result { case proceed, cancel, rasterize }
 
@@ -89,33 +89,54 @@ enum SendCheck {
         return out
     }
 
-    /// Fragt nach und entfernt auf Wunsch den Inhalt unter den Abdeckungen wirklich.
     static func run(doc: WDocument, window: NSWindow, verb: String) -> Result {
-        let cv = covers(doc.pdf)
-        guard !cv.isEmpty, let canvas = doc.controller?.canvas else { return .proceed }
+        guard let canvas = doc.controller?.canvas else { return .proceed }
+        let red = canvas.coverMarks(redact: true)
+        if !red.isEmpty {
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = red.count == 1 ? "Eine Schwärzung ist noch nicht angewendet" : "\(red.count) Schwärzungen sind noch nicht angewendet"
+            a.informativeText = "Die markierten Stellen sind bisher nur abgedeckt – der Inhalt darunter steht noch in der Datei und lässt sich herauskopieren."
+            a.addButton(withTitle: "Anwenden und \(verb)")
+            a.addButton(withTitle: "Nur abdecken und \(verb)")
+            a.addButton(withTitle: "Abbrechen")
+            switch a.runModal() {
+            case .alertThirdButtonReturn: return .cancel
+            case .alertFirstButtonReturn:
+                guard let rep = canvas.applyRedaction(red, paint: true, removeAnnots: true, action: "Schwärzungen anwenden") else {
+                    return failed(verb: verb)
+                }
+                if !rep.leaks.isEmpty { return failed(verb: verb) }
+            default: break
+            }
+        }
+        let white = canvas.coverMarks(redact: false)
+        guard !white.isEmpty else { return .proceed }
         let a = NSAlert()
         a.alertStyle = .warning
-        a.messageText = cv.count == 1 ? "Eine Stelle ist nur abgedeckt" : "\(cv.count) Stellen sind nur abgedeckt"
-        a.informativeText = "Unter „Abdecken“ und „Schwärzen“ steckt der ursprüngliche Inhalt noch in der Datei und lässt sich herauskopieren. Soll er vor dem \(verb) wirklich entfernt werden?"
+        a.messageText = white.count == 1 ? "Eine Stelle ist nur abgedeckt" : "\(white.count) Stellen sind nur abgedeckt"
+        a.informativeText = "Unter „Abdecken“ steckt der ursprüngliche Inhalt noch in der Datei und lässt sich herauskopieren. Soll er vor dem \(verb) wirklich entfernt werden?"
         a.addButton(withTitle: "Darunter entfernen")
         a.addButton(withTitle: "Trotzdem \(verb)")
         a.addButton(withTitle: "Abbrechen")
-        let r = a.runModal()
-        if r == .alertThirdButtonReturn { return .cancel }
-        if r == .alertSecondButtonReturn { return .proceed }
-        let (removed, partial) = canvas.removeContentUnderCovers()
-        Log.w("SendCheck: entfernt \(removed), teilweise \(partial)")
-        guard partial > 0 else { return .proceed }
+        switch a.runModal() {
+        case .alertThirdButtonReturn: return .cancel
+        case .alertSecondButtonReturn: return .proceed
+        default:
+            guard let rep = canvas.applyRedaction(white, paint: false, removeAnnots: false, action: "Inhalt unter Abdeckung entfernen"), rep.leaks.isEmpty else {
+                return failed(verb: verb)
+            }
+            return .proceed
+        }
+    }
+
+    private static func failed(verb: String) -> Result {
         let b = NSAlert()
         b.alertStyle = .warning
-        b.messageText = "\(removed) Elemente entfernt, \(partial) nur teilweise abgedeckt"
-        b.informativeText = "Teilweise abgedeckte Textzeilen bleiben erhalten, damit sichtbarer Text nicht verschwindet. Ganz sicher ist nur ein Bild-PDF – dann ist nichts mehr kopierbar."
+        b.messageText = "Der Inhalt ließ sich nicht sicher entfernen"
+        b.informativeText = "Ganz sicher ist ein Bild-PDF – dann ist nichts mehr kopierbar."
         b.addButton(withTitle: "Als Bild-PDF \(verb)")
-        b.addButton(withTitle: "So \(verb)")
         b.addButton(withTitle: "Abbrechen")
-        let r2 = b.runModal()
-        if r2 == .alertFirstButtonReturn { return .rasterize }
-        if r2 == .alertThirdButtonReturn { return .cancel }
-        return .proceed
+        return b.runModal() == .alertFirstButtonReturn ? .rasterize : .cancel
     }
 }
