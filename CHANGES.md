@@ -1,5 +1,8 @@
 # Änderungen
 
+## 1.7.1 – 20.10.2026
+- Schwärzen: große Bilder werden bei 300 dpi und normaler JPEG-Qualität neu geschrieben, auch mit Transparenz (Maske separat) – die Datei wächst nicht mehr (Parookaville-Ticket 3,4 MB → 0,8 MB, Scan 6,0 → 4,0 MB)
+
 ## 1.7 – 20.10.2026
 - Gesicherte Dateien sind nicht mehr größer als das Original: geteilte Schriften und Bilder werden beim Zurücksetzen des Originalinhalts nur einmal übernommen, neue Inhaltsströme werden gepackt, lesbare Strings als Literal statt Hex geschrieben (Mietvertrag 32 → 28,5 MB, Rechnung 179 → 93 KB)
 - Schwärzen 2–4× schneller: Textkästen werden gerechnet statt gerendert, Zeichen-Vermessung und Nachweis nur im Zeilenbereich (Eurowings 7,3 → 3,0 s, Mietvertrag 11,8 → 3,6 s)

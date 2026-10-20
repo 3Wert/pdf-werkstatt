@@ -730,7 +730,8 @@ final class Redactor {
             let filt = f.resolve(img["Filter"] ?? .null)
             wasJPEG = filt.nameValue == "DCTDecode" || (filt.arrayValue?.contains { f.resolve($0).nameValue == "DCTDecode" } ?? false)
         }
-        dpi = min(600, max(72, dpi))
+        // Große Bilder (ab etwa A6) bei 300 dpi deckeln – darüber wird die Datei nur größer, nicht schärfer
+        dpi = min(b.width * b.height > 300 * 400 ? 300 : 600, max(72, dpi))
         var scale = dpi / 72
         while b.width * scale * b.height * scale > 30_000_000 { scale *= 0.8 }
         let w = Int(ceil(b.width * scale)), h = Int(ceil(b.height * scale))
@@ -753,9 +754,28 @@ final class Redactor {
         var dict: [String: PDFObj] = ["Type": .name("XObject"), "Subtype": .name("Image"), "Width": .int(w), "Height": .int(h),
                                       "ColorSpace": .name("DeviceRGB"), "BitsPerComponent": .int(8)]
         var payload: [UInt8]
-        if opaque && (wasJPEG || w * h > 400_000) {
-            guard let cg = ctx.makeImage(), let jpg = NSBitmapImageRep(cgImage: cg).representation(using: .jpeg, properties: [.compressionFactor: 0.88]) else { return nil }
+        if wasJPEG || w * h > 400_000 {
+            // Farben als JPEG (auch mit Transparenz – die Maske kommt separat als Flate), sonst wächst die Datei um Megabytes
+            var rgb = [UInt8](repeating: 0, count: w * h * 3)
+            var alpha = [UInt8](repeating: 255, count: w * h)
+            for i in 0..<(w * h) {
+                let a = px[i * 4 + 3]; alpha[i] = a
+                if a == 0 { rgb[i * 3] = 255; rgb[i * 3 + 1] = 255; rgb[i * 3 + 2] = 255 }   // unsichtbar → weiß, nicht schwarz (JPEG-Säume)
+                else if a == 255 { rgb[i * 3] = px[i * 4]; rgb[i * 3 + 1] = px[i * 4 + 1]; rgb[i * 3 + 2] = px[i * 4 + 2] }
+                else { for c in 0..<3 { rgb[i * 3 + c] = UInt8(min(255, Int(px[i * 4 + c]) * 255 / Int(a))) } }
+            }
+            guard let prov = CGDataProvider(data: Data(rgb) as CFData),
+                  let cgRGB = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 24, bytesPerRow: w * 3, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue), provider: prov, decode: nil, shouldInterpolate: true, intent: .defaultIntent),
+                  let jpg = NSBitmapImageRep(cgImage: cgRGB).representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else { return nil }
             payload = [UInt8](jpg); dict["Filter"] = .name("DCTDecode")
+            if !opaque {
+                let sm = nextObj; nextObj += 1
+                let smData = RedactRaster.zlib(alpha)
+                guard !smData.isEmpty else { return nil }
+                newObjects.append((sm, .stream(["Type": .name("XObject"), "Subtype": .name("Image"), "Width": .int(w), "Height": .int(h),
+                                                "ColorSpace": .name("DeviceGray"), "BitsPerComponent": .int(8), "Filter": .name("FlateDecode")], smData)))
+                dict["SMask"] = .ref(sm, 0)
+            }
         } else {
             var rgb = [UInt8](repeating: 0, count: w * h * 3)
             var alpha = [UInt8](repeating: 0, count: w * h)
