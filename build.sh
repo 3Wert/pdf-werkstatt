@@ -13,7 +13,7 @@ VERSION="$(cat VERSION 2>/dev/null || echo 1.0)"
 BUILD=$(date +%Y%m%d%H%M)
 
 mkdir -p build
-swiftc -swift-version 5 -O -target arm64-apple-macos14.0 -o build/PDFWerkstatt Sources/*.swift -framework AppKit -framework PDFKit -framework AVFoundation -framework CoreImage
+swiftc -swift-version 5 -O -target arm64-apple-macos14.0 -o build/PDFWerkstatt Sources/*.swift -framework AppKit -framework PDFKit -framework AVFoundation -framework CoreImage -framework Vision
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 mv build/PDFWerkstatt "$APP/Contents/MacOS/"
 

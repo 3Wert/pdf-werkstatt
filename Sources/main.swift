@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UndoStore.purge()
         RedactTest.runIfRequested()
         SaveTest.runIfRequested()
+        OCRTest.runIfRequested()
         Updater.start()
         SelfTest.runIfRequested()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
@@ -194,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tools.addItem(ann)
         add(tools, "Suchen und schwärzen …", #selector(MainWindowController.searchAndRedact(_:)), "f", [.command, .option])
         add(tools, "Schwärzungen anwenden …", #selector(MainWindowController.applyRedactions(_:)), "r", [.command, .shift])
+        add(tools, "Text erkennen (OCR) …", #selector(MainWindowController.recognizeText(_:)), "t", [.command, .option])
         let sig = NSMenuItem(title: "Unterschreiben", action: nil, keyEquivalent: "")
         let sigM = NSMenu()
         add(sigM, "Gespeicherte Unterschrift einsetzen", #selector(MainWindowController.insertSavedSignature(_:)))

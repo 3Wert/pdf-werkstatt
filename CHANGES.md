@@ -1,5 +1,11 @@
 # Änderungen
 
+## 1.5 – 20.10.2026
+- Texterkennung (OCR): Werkzeuge › Text erkennen (OCR) … (⌥⌘T) erkennt Text auf gescannten Seiten mit Apple Vision (Deutsch/Englisch, ohne Internet) und legt ihn unsichtbar wortgenau über das Bild – danach durchsuchbar, kopierbar und für „Suchen und schwärzen“ erreichbar; die Darstellung bleibt pixelgleich
+- Beim Öffnen eines Scans ohne Textebene wird die Erkennung angeboten
+- Schief fotografierte und quer liegende Seiten werden erkannt (vier Drehungen), gedrehte Seiten (/Rotate) ebenfalls
+- Schwärzen auf erkannten Seiten entfernt Bildpixel und Textebene zusammen
+
 ## 1.4 – 20.10.2026
 - Sichern behält den Originalinhalt unveränderter Seiten: Text bleibt durchsuch- und kopierbar, auch bei Browser-Ausdrucken (Chrome/Skia, Type3-Schriften) – PDFKit hatte ihn bisher beim Sichern in Pfade verwandelt. Darstellung pixelgleich, Datei meist kleiner
 - Der eigene PDF-Leser versteht jetzt xref-Streams, Objektströme, Hybrid-Dateien sowie ASCII85-/ASCIIHex-Filter

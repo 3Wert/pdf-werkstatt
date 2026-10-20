@@ -48,6 +48,37 @@ enum Dialogs {
         return a.runModal() == .alertFirstButtonReturn ? f.stringValue : nil
     }
 
+    // MARK: Texterkennung
+
+    static func ocr(window: NSWindow, controller wc: MainWindowController, auto: Bool) {
+        guard let pdf = wc.wdoc?.pdf else { return }
+        let a = NSAlert()
+        a.messageText = "Text erkennen (OCR)"
+        a.informativeText = "Erkennt Text auf gescannten Seiten und legt ihn unsichtbar über das Bild. Deutsch und Englisch, ohne Internet. Die Darstellung bleibt unverändert."
+        let scope = NSPopUpButton()
+        let (todo, skipped) = OCR.candidatePages(pdf, onlyWithoutText: true)
+        let cur = wc.canvas.currentPage.map { pdf.index(for: $0) } ?? 0
+        scope.addItems(withTitles: ["Seiten ohne Textebene (\(todo.count))", "Nur diese Seite (\(cur + 1))", "Alle Seiten (\(pdf.pageCount)) – auch mit vorhandenem Text"])
+        let g = grid([[lbl("Umfang:"), scope]])
+        g.frame = NSRect(x: 0, y: 0, width: 420, height: 30)
+        a.accessoryView = g
+        a.addButton(withTitle: "Erkennen")
+        a.addButton(withTitle: "Abbrechen")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        var pages: [Int]
+        switch scope.indexOfSelectedItem {
+        case 1: pages = [cur]
+        case 2: pages = Array(0..<pdf.pageCount)
+        default: pages = todo
+        }
+        if pages.isEmpty {
+            let n = NSAlert(); n.messageText = "Nichts zu erkennen"
+            n.informativeText = skipped.isEmpty ? "Das Dokument hat keine Seiten." : "Alle \(skipped.count) Seiten haben bereits eine Textebene. Für eine erneute Erkennung „Alle Seiten“ wählen."
+            n.runModal(); return
+        }
+        wc.runOCR(pages: pages)
+    }
+
     // MARK: Suchen und schwärzen
 
     static func searchAndRedact(window: NSWindow, controller wc: MainWindowController) {

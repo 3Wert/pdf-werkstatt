@@ -28,6 +28,7 @@ final class WDocument: NSDocument {
             pdf.insert(PDFTools.blankPage(size: PDFTools.a4), at: 0)
         }
         addWindowController(MainWindowController(document: self))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.controller?.offerOCRIfScanned() }
         if let um = undoManager {
             for n in [NSNotification.Name.NSUndoManagerDidCloseUndoGroup, .NSUndoManagerDidUndoChange, .NSUndoManagerDidRedoChange] {
                 NotificationCenter.default.addObserver(self, selector: #selector(changed), name: n, object: um)
@@ -78,7 +79,10 @@ final class WDocument: NSDocument {
         hydrate(document: d)
         pdf = d
         if password == nil { setOrigin(data) }
+        scanCandidate = password == nil && OCR.looksScanned(data, pdf: d)
     }
+    /// Beim Öffnen erkannt: Scan ohne Textebene → der Fenster-Controller bietet Texterkennung an
+    var scanCandidate = false
 
     override func data(ofType typeName: String) throws -> Data {
         controller?.canvas.endEditing()

@@ -14,12 +14,40 @@ extension Canvas {
 /// Selbsttest: PDFW_SELFTEST=<Ordner> – bearbeitet das erste Dokument per Skript, macht Fensterbilder und speichert.
 enum SelfTest {
     static func runIfRequested() {
+        if let dir = ProcessInfo.processInfo.environment["PDFW_OCR_UITEST"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { ocrUI(dir) }
+            return
+        }
         if let dir = ProcessInfo.processInfo.environment["PDFW_REDACT_UITEST"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { redactUI(dir) }
             return
         }
         guard let dir = ProcessInfo.processInfo.environment["PDFW_SELFTEST"] else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { step(dir) }
+    }
+
+    /// PDFW_OCR_UITEST=<Ordner> scan.pdf – Texterkennung über den Fenster-Controller (Fortschritt, Einsetzen, Widerrufen, Sichern)
+    static func ocrUI(_ dir: String) {
+        guard let doc = NSDocumentController.shared.documents.first as? WDocument, let wc = doc.controller, let w = wc.window else { return }
+        NSApp.activate(ignoringOtherApps: true); w.makeKeyAndOrderFront(nil)
+        func found(_ t: String) -> Bool { !doc.pdf.findString(t, withOptions: [.caseInsensitive]).isEmpty }
+        func closeSheet() { if let s = w.attachedSheet { w.endSheet(s) } }
+        note("Scan erkannt (Angebot beim Öffnen): \(doc.scanCandidate) (true erwartet) · 'Mustermann' vorher über PDFKit-Live-Text: \(found("Mustermann")) (egal)")
+        var done = false
+        wc.runOCR(pages: [0]) { rep in note("OCR: \(rep?.summary ?? "FEHLER")"); done = true }
+        func waitThenContinue(_ tries: Int) {
+            if !done && tries < 60 { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { waitThenContinue(tries + 1) }; return }
+            run([
+                { closeSheet(); note("nach OCR: 'Mustermann' auffindbar: \(found("Mustermann")) (true erwartet), 'DE89': \(found("DE89")) (true erwartet)") },
+                { shot(wc, dir + "/ocr-1.png"); doc.undoManager?.undo() },
+                { note("nach Widerrufen: 'Mustermann' auffindbar: \(found("Mustermann")) (false erwartet)"); doc.undoManager?.redo() },
+                { note("nach Wiederholen: 'Mustermann' auffindbar: \(found("Mustermann")) (true erwartet)")
+                  guard let data = try? doc.data(ofType: "com.adobe.pdf"), let d = PDFDocument(data: data) else { note("Sichern: FEHLER"); return }
+                  try? data.write(to: URL(fileURLWithPath: dir + "/ocr-gesichert.pdf"))
+                  note("gesichert: \(data.count / 1024) KB, 'Mustermann': \(!d.findString("Mustermann", withOptions: []).isEmpty) (true erwartet)") },
+            ]) { finish(dir) }
+        }
+        waitThenContinue(0)
     }
 
     /// PDFW_REDACT_UITEST=<Ordner> datei.pdf – Schwärzen über die Oberfläche: markieren, anwenden, Abdeckung leeren, widerrufen, sichern

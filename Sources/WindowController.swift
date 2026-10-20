@@ -137,6 +137,21 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     required init?(coder: NSCoder) { nil }
 
     /// Nach einem Eingriff in den Seiteninhalt: neues PDFDocument einhängen, Seite/Zoom/Position behalten
+    /// Nach dem Öffnen: Scan ohne Textebene → einmal anbieten
+    func offerOCRIfScanned() {
+        guard let d = wdoc, d.scanCandidate, let w = window, ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil, ProcessInfo.processInfo.environment["PDFW_REDACT_UITEST"] == nil, ProcessInfo.processInfo.environment["PDFW_OCR_UITEST"] == nil else { return }
+        d.scanCandidate = false
+        let a = NSAlert()
+        a.messageText = "Gescanntes Dokument ohne Textebene"
+        a.informativeText = "Soll der Text erkannt werden? Danach ist das Dokument durchsuchbar und kopierbar, und „Suchen und schwärzen“ findet die Stellen. Die Darstellung ändert sich nicht."
+        a.addButton(withTitle: "Text erkennen")
+        a.addButton(withTitle: "Später")
+        a.beginSheetModal(for: w) { r in
+            guard r == .alertFirstButtonReturn, let pdf = d.pdf else { return }
+            self.runOCR(pages: OCR.candidatePages(pdf, onlyWithoutText: true).todo)
+        }
+    }
+
     func documentReplaced(pageIndex: Int) {
         guard let d = wdoc?.pdf else { return }
         let scale = canvas.scaleFactor, auto = canvas.autoScales
@@ -451,6 +466,44 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         a.informativeText = lines.joined(separator: "\n")
         a.beginSheetModal(for: w)
         return rep.leaks.isEmpty
+    }
+
+    // MARK: Texterkennung
+
+    @objc func recognizeText(_ s: Any?) { Dialogs.ocr(window: window!, controller: self, auto: false) }
+
+    /// OCR auf Seiten ausführen (mit Fortschritt), Ergebnis widerrufbar einsetzen
+    func runOCR(pages: [Int], completion: ((OCRReport?) -> Void)? = nil) {
+        guard let d = wdoc, let w = window else { return }
+        canvas.endEditing()
+        d.touch()
+        guard let fresh = d.currentData() else { return }
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 90), styleMask: [.titled], backing: .buffered, defer: false)
+        let label = NSTextField(labelWithString: "Text wird erkannt …")
+        label.frame = NSRect(x: 20, y: 52, width: 320, height: 20)
+        let bar = NSProgressIndicator(frame: NSRect(x: 20, y: 24, width: 320, height: 18))
+        bar.minValue = 0; bar.maxValue = Double(pages.count); bar.isIndeterminate = false
+        panel.contentView?.addSubview(label); panel.contentView?.addSubview(bar)
+        w.beginSheet(panel)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = OCR.apply(to: fresh, pages: pages) { k, n in
+                DispatchQueue.main.async { bar.doubleValue = Double(k); label.stringValue = "Seite \(min(k + 1, n)) von \(n) …" }
+            }
+            DispatchQueue.main.async {
+                w.endSheet(panel)
+                guard let (out, rep) = result else {
+                    let a = NSAlert(); a.alertStyle = .warning; a.messageText = "Texterkennung nicht möglich"
+                    a.informativeText = "Diese Datei lässt sich nicht direkt bearbeiten (verschlüsselt oder ungewöhnlich aufgebaut)."
+                    a.beginSheetModal(for: w); completion?(nil); return
+                }
+                if !rep.pages.isEmpty { d.replaceData(out, old: fresh, action: "Text erkennen") }
+                let a = NSAlert()
+                a.messageText = rep.pages.isEmpty ? "Kein Text erkannt" : "Text erkannt"
+                a.informativeText = rep.summary + (rep.notes.isEmpty ? "" : "\n" + rep.notes.joined(separator: "\n")) + (rep.pages.isEmpty ? "" : "\nDer Text liegt unsichtbar über dem Bild – jetzt durchsuchbar, kopierbar und für „Suchen und schwärzen“ erreichbar.")
+                a.beginSheetModal(for: w)
+                completion?(rep)
+            }
+        }
     }
 
     @objc func searchAndRedact(_ s: Any?) {
