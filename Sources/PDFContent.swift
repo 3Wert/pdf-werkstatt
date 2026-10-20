@@ -232,7 +232,7 @@ enum PDFWriter {
         case .bool(let b): out += Array((b ? "true" : "false").utf8)
         case .int(let i): out += Array(String(i).utf8)
         case .real(let r):
-            var s = String(format: "%.4f", r)
+            var s = String(format: "%.6f", r)      // 6 Stellen: Matrizen wie 0.8001272 dürfen beim Neuschreiben nicht verrutschen
             while s.hasSuffix("0") { s.removeLast() }
             if s.hasSuffix(".") { s.removeLast() }
             out += Array(s.utf8)
@@ -798,6 +798,18 @@ final class ContentStream {
             if case .name(let n) = tok.obj, let r = map[n] { out += PDFWriter.serialize(.name(r)) }
             else { out += PDFWriter.serialize(tok.obj) }
             out.append(tok.isOp ? 0x0A : 0x20)
+        }
+        return out
+    }
+
+    /// Quelltext eines Elements (Operanden + Operator), so wie `render` ihn ausgeben würde
+    func source(_ k: Int) -> [UInt8] {
+        var out: [UInt8] = []
+        for t in elements[k].tokens {
+            if tokens[t].op == "BI", t > 0, case .string(let raw) = tokens[t - 1].obj { out += Array("BI ".utf8); out += raw; out += Array(" EI\n".utf8); continue }
+            if t + 1 < tokens.count, tokens[t + 1].op == "BI" { continue }
+            out += PDFWriter.serialize(tokens[t].obj)
+            out.append(tokens[t].isOp ? 0x0A : 0x20)
         }
         return out
     }

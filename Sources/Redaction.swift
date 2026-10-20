@@ -217,6 +217,7 @@ final class Redactor {
         guard var file = try? PDFFile(data: data) else { report.notes.append("Datei nicht lesbar (verschlüsselt oder xref-Stream)"); return nil }
         var cur = data
         var updates: [Int: (content: [UInt8], extra: [String: PDFObj])] = [:]
+        var pending: [PendingPage] = []
         nextObj = file.firstFreeObject + 50      // Reserve: updated() nummeriert Inhaltsströme hinter die neuen Objekte
         let pageIndices = Set(marks.map { $0.pageIndex }).sorted()
         for pageIndex in pageIndices {
@@ -244,15 +245,35 @@ final class Redactor {
             var zones = pageMarks.map { $0.rect }
             let color = pageMarks.first?.color ?? RGBA(.black)
 
+            // Unsichtbarer oder weißer Text (z. B. Texterkennungs-Ebene über Scans) hinterlässt beim Vermessen keine Pixel.
+            // Solche Textstücke noch einmal mit erzwungener Sichtbarkeit vermessen – gerade sie sind das Leck.
+            var boundsOf: [Int: CGRect] = [:]
+            let hidden = model.elements.indices.filter { model.elements[$0].kind == .text && !model.elements[$0].bounds.isUsable }
+            if !hidden.isEmpty {
+                var variants = [model.stream.render(model.elements.indices.map { .remove($0) })]
+                for k in hidden {
+                    let tr = model.elements[k].textState?.tr ?? 0
+                    variants.append(model.stream.render([.isolate(k), .replace(k, Array("0 Tr 0 g 0 G ".utf8) + model.stream.source(k) + Array(" \(tr) Tr".utf8))]))
+                }
+                let bs = RedactRaster.bounds(file: file, pageObj: pageObj, mediaBox: model.mediaBox, variants: variants, scale: 1)
+                for (i, k) in hidden.enumerated() where i + 1 < bs.count { if let b = bs[i + 1] { boundsOf[k] = b.insetBy(dx: -1, dy: -1) } }
+            }
+            func coverage(_ k: Int) -> CGFloat {
+                let b = boundsOf[k] ?? model.elements[k].bounds
+                guard b.isUsable, b.width > 0, b.height > 0 else { return 0 }
+                return rects.map { r -> CGFloat in let i = b.intersection(r); return i.isNull ? 0 : (i.width * i.height) / max(b.width * b.height, 0.01) }.max() ?? 0
+            }
+
             for k in model.elements.indices where !needRaster {
-                let e = model.elements[k]
-                let cov = rects.map { model.coverage(k, by: $0) }.max() ?? 0
+                var e = model.elements[k]
+                if let b = boundsOf[k] { e.bounds = b }
+                let cov = coverage(k)
                 guard cov > 0.001, e.bounds.isUsable else { continue }
                 switch e.kind {
                 case .text:
                     switch redactText(k, model: model, file: file, pageObj: pageObj, rects: rects, resources: resources) {
                     case .replaced(let bytes, let n, let removedBoxes):
-                        edits.append(.replace(k, bytes)); report.glyphs += n; zones += removedBoxes
+                        edits.append(.replace(k, bytes)); report.glyphs += n; zones += removedBoxes; zones.append(e.bounds)   // ganze Zeile neu geschrieben – Lage per Einzelprüfung (2×) gesichert
                     case .unchanged: break
                     case .removeWhole:
                         if e.canRemove { edits.append(.remove(k)); report.textElements += 1; zones.append(e.bounds) }
@@ -295,20 +316,46 @@ final class Redactor {
                 }
                 if resChanged { extra["Resources"] = .dict(resources) }
             }
+            pending.append(PendingPage(pageIndex: pageIndex, pageObj: pageObj, content: content, extra: extra, marks: pageMarks, color: color,
+                                       rastered: needRaster, mediaBox: model.mediaBox, openStates: model.stream.openStates, endsInText: model.stream.endsInText))
+            report.changedZones[pageIndex] = zones
+        }
+
+        // Prüfung unabhängig von der Art des Inhalts: Ergebnis ohne Flächen rendern – in jeder Markierung darf nur noch
+        // Leere oder die Schwärzungsfarbe (geschwärzte Bildpixel) zu sehen sein. Sonst ist etwas stehen geblieben
+        // (z. B. Text als Vektorpfade auf einer zu komplexen Seite) → Seite als Bild.
+        for pp in pending where !pp.rastered { updates[pp.pageObj] = (pp.content, pp.extra) }
+        if let probe = file.updated(pages: updates, newObjects: newObjects) {
+            let residue = Redactor.residue(probe, pending: pending)
+            for (k, pp) in pending.enumerated() where !pp.rastered && (residue[pp.pageIndex] ?? 0) > 0 {
+                Log.w("Schwärzen: Seite \(pp.pageIndex + 1) – unter der Markierung ist noch Inhalt zu sehen (\(residue[pp.pageIndex] ?? 0) px), Seite wird als Bild geschrieben")
+                guard let (c, res) = rasterizePage(file: file, pageIndex: pp.pageIndex, mediaBox: pp.mediaBox, rects: pp.marks.map { $0.rect }, color: pp.color) else {
+                    report.notes.append("Seite \(pp.pageIndex + 1): Rasterung fehlgeschlagen"); return nil
+                }
+                pending[k].content = c; pending[k].extra = ["Resources": .dict(res)]; pending[k].rastered = true
+                report.pagesRasterized.append(pp.pageIndex)
+                report.notes.append("Seite \(pp.pageIndex + 1): Inhalt unter der Markierung ließ sich nicht einzeln entfernen – Seite als Bild geschrieben")
+                report.changedZones[pp.pageIndex] = [pp.mediaBox]
+            }
+        } else { report.notes.append("Prüfung nicht möglich"); return nil }
+
+        updates = [:]
+        for pp in pending {
+            var content = pp.content
             if paintBoxes {
                 content += Array("\n".utf8)
-                if !needRaster {
-                    if model.stream.endsInText { content += Array("ET\n".utf8) }
-                    for _ in 0..<model.stream.openStates { content += Array("Q\n".utf8) }
+                if !pp.rastered {
+                    if pp.endsInText { content += Array("ET\n".utf8) }
+                    for _ in 0..<pp.openStates { content += Array("Q\n".utf8) }
                 }
-                for m in pageMarks {
+                for m in pp.marks {
                     let r = m.rect
                     content += Array("q \(fmt(m.color.r)) \(fmt(m.color.g)) \(fmt(m.color.b)) rg \(fmt(r.minX)) \(fmt(r.minY)) \(fmt(r.width)) \(fmt(r.height)) re f Q\n".utf8)
                 }
             }
-            updates[pageObj] = (content, extra)
-            report.changedZones[pageIndex] = zones
+            updates[pp.pageObj] = (content, pp.extra)
         }
+        report.pagesRasterized.sort()
         guard let inc = file.updated(pages: updates, newObjects: newObjects), let f2 = try? PDFFile(data: inc), let out = f2.compacted() else {
             report.notes.append("Datei konnte nicht neu geschrieben werden"); return nil
         }
@@ -321,6 +368,56 @@ final class Redactor {
         var out = Set<String>()
         for (i, t) in cs.tokens.enumerated() where t.op == "Do" && i > 0 {
             if let n = cs.tokens[i - 1].obj.nameValue { out.insert(n) }
+        }
+        return out
+    }
+
+    struct PendingPage {
+        var pageIndex: Int, pageObj: Int
+        var content: [UInt8], extra: [String: PDFObj]
+        var marks: [RedactMark], color: RGBA
+        var rastered: Bool
+        var mediaBox: CGRect
+        var openStates: Int, endsInText: Bool
+    }
+
+    /// Pixel je Seite, die innerhalb der Markierungen weder leer noch Schwärzungsfarbe sind
+    static func residue(_ data: Data, pending: [PendingPage]) -> [Int: Int] {
+        guard let prov = CGDataProvider(data: data as CFData), let doc = CGPDFDocument(prov) else { return [:] }
+        var out: [Int: Int] = [:]
+        for pp in pending where !pp.rastered {
+            guard let pg = doc.page(at: pp.pageIndex + 1) else { continue }
+            let box = pg.getBoxRect(.mediaBox)
+            var scale: CGFloat = 2
+            while box.width * scale * box.height * scale > 20_000_000 { scale *= 0.8 }
+            let w = Int(ceil(box.width * scale)), h = Int(ceil(box.height * scale))
+            guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue), let px = ctx.data?.bindMemory(to: UInt8.self, capacity: w * h * 4) else { continue }
+            ctx.setFillColor(gray: 1, alpha: 1); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.scaleBy(x: scale, y: scale); ctx.translateBy(x: -box.minX, y: -box.minY)
+            ctx.drawPDFPage(pg)
+            var bad = 0
+            for m in pp.marks {
+                let r = m.rect.insetBy(dx: 1.2, dy: 1.2)
+                guard r.width > 0, r.height > 0 else { continue }
+                let x0 = max(0, Int(((r.minX - box.minX) * scale).rounded(.up))), x1 = min(w - 1, Int(((r.maxX - box.minX) * scale).rounded(.down)))
+                let y0 = max(0, Int(((box.maxY - r.maxY) * scale).rounded(.up))), y1 = min(h - 1, Int(((box.maxY - r.minY) * scale).rounded(.down)))
+                guard x1 >= x0, y1 >= y0 else { continue }
+                let mc = [Int(m.color.r * 255), Int(m.color.g * 255), Int(m.color.b * 255)]
+                var badHere = 0
+                for y in y0...y1 {
+                    for x in x0...x1 {
+                        let i = (y * w + x) * 4
+                        let c = [Int(px[i]), Int(px[i + 1]), Int(px[i + 2])]
+                        let blank = c.allSatisfy { $0 > 232 }
+                        let mark = zip(c, mc).allSatisfy { abs($0 - $1) < 60 }
+                        if !blank && !mark { badHere += 1 }
+                    }
+                }
+                let area = (x1 - x0 + 1) * (y1 - y0 + 1)
+                if badHere > max(12, area / 400) { bad += badHere }
+            }
+            out[pp.pageIndex] = bad
         }
         return out
     }
@@ -654,10 +751,27 @@ enum RedactTest {
             guard let doc = PDFDocument(url: url), let fresh = doc.dataRepresentation() else { lines.append("\(name): nicht ladbar"); ok = false; continue }
             let normalized = PDFDocument(data: fresh)!
             var marks: [RedactMark] = []
+            var secrets: [String] = []
+            let real = ProcessInfo.processInfo.environment["PDFW_REDACT_REAL"] != nil
+            if real {
+                // Echte Dateien: Vorgaben (IBAN, E-Mail, Telefon, Datum) auf höchstens 3 Seiten + ein Block mitten auf Seite 1 (trifft Bilder/Linien/Text gemischt)
+                for (_, pat) in RedactPatterns.presets where !pat.isEmpty {
+                    for hit in RedactPatterns.find(in: normalized, pattern: pat, isRegex: true, caseSensitive: true) where hit.page < 3 {
+                        marks.append(RedactMark(pageIndex: hit.page, rect: hit.rect, color: RGBA(.black)))
+                        let t = hit.text.trimmingCharacters(in: .whitespaces)
+                        if t.count >= 6 { secrets.append(t) }
+                    }
+                }
+                if let p = normalized.page(at: 0) {
+                    let b = p.bounds(for: .cropBox)
+                    marks.append(RedactMark(pageIndex: 0, rect: CGRect(x: b.minX + b.width * 0.15, y: b.minY + b.height * 0.45, width: b.width * 0.5, height: b.height * 0.08), color: RGBA(.black)))
+                }
+            } else {
             for (pattern, regex) in [(#"DE89\s?3704\s?0044\s?0532\s?0130\s?00"#, true), ("Mustermann", false), ("geheim123", false)] {
                 for hit in RedactPatterns.find(in: normalized, pattern: pattern, isRegex: regex, caseSensitive: false) {
                     marks.append(RedactMark(pageIndex: hit.page, rect: hit.rect, color: RGBA(.black)))
                 }
+            }
             }
             if name.contains("chrome") { marks.append(RedactMark(pageIndex: 0, rect: CGRect(x: 100, y: 505, width: 60, height: 30), color: RGBA(.black))) }   // Teil des eingebetteten Scan-Bilds
             if marks.isEmpty, let p = normalized.page(at: 0) {   // reiner Scan: festes Rechteck über der ersten Zeile
@@ -674,15 +788,22 @@ enum RedactTest {
             for m in marks {
                 if let p = outDoc.page(at: m.pageIndex), let s = p.selection(for: m.rect.insetBy(dx: 1, dy: 1))?.string?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { leaks.append("S\(m.pageIndex + 1): „\(s)“") }
             }
-            for t in ["DE89", "0532 0130", "Mustermann", "geheim123"] where !outDoc.findString(t, withOptions: [.caseInsensitive]).isEmpty { leaks.append("„\(t)“ noch auffindbar") }
+            for t in (real ? Array(Set(secrets)) : ["DE89", "0532 0130", "Mustermann", "geheim123"]) where !outDoc.findString(t, withOptions: [.caseInsensitive]).isEmpty {
+                // Gleicher Text kann auf Seiten > 3 legitim stehen bleiben
+                let pages = outDoc.findString(t, withOptions: [.caseInsensitive]).compactMap { $0.pages.first.map { outDoc.index(for: $0) } }
+                if !real || pages.contains(where: { $0 < 3 }) { leaks.append("„\(t)“ noch auffindbar") }
+            }
             let eofs = out.ranges(of: "%%EOF".data(using: .utf8)!).count
             let diffs = red.checkAppearance(before: fresh, after: out)
             let diffText = diffs.map { "S\($0.key + 1): \($0.value) px" }.joined(separator: ", ")
-            let outURL = url.deletingPathExtension().appendingPathExtension("geschwaerzt.pdf")
+            let resDir = URL(fileURLWithPath: dir).appendingPathComponent("Ergebnisse")
+            try? FileManager.default.createDirectory(at: resDir, withIntermediateDirectories: true)
+            let base = resDir.appendingPathComponent((name as NSString).deletingPathExtension)
+            let outURL = base.appendingPathExtension("geschwaerzt.pdf")
             try? out.write(to: outURL)
             // Bild der ersten geschwärzten Seite
             if let p = outDoc.page(at: marks.first?.pageIndex ?? 0), let img = PDFTools.render(p, dpi: 100) {
-                try? NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])?.write(to: url.deletingPathExtension().appendingPathExtension("geschwaerzt.png"))
+                try? NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])?.write(to: base.appendingPathExtension("geschwaerzt.png"))
             }
             let good = leaks.isEmpty && eofs == 1 && diffs.values.allSatisfy { $0 < 60 }
             if !good { ok = false }
@@ -691,7 +812,7 @@ enum RedactTest {
         }
         let text = lines.joined(separator: "\n")
         print(text)
-        try? text.write(toFile: dir + "/schwaerzen-ergebnis.txt", atomically: true, encoding: .utf8)
+        try? text.write(toFile: dir + "/Ergebnisse/schwaerzen-ergebnis.txt", atomically: true, encoding: .utf8)
         exit(ok ? 0 : 1)
     }
 }

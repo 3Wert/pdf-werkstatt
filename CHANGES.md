@@ -1,5 +1,10 @@
 # Änderungen
 
+## 1.3.1 – 20.10.2026
+- Schwärzen: unsichtbarer Text (Texterkennungs-Ebene über Scans) und weißer Text unter der Markierung wird jetzt ebenfalls entfernt – in 1.3 blieb er bei Scans in der Datei
+- Schwärzen: neue Prüfung, unabhängig von der Art des Inhalts – das Ergebnis wird ohne die schwarzen Flächen gerendert, unter jeder Markierung darf nichts mehr zu sehen sein; sonst wird die Seite als Bild geschrieben. Fängt z. B. Text, der als Vektorpfade gezeichnet ist (Formulare, Druckvorlagen)
+- Zahlen im Seiteninhalt werden genauer geschrieben (6 statt 4 Nachkommastellen) – beim Bearbeiten und Schwärzen verrutscht nichts mehr um Bruchteile eines Punkts
+
 ## 1.3 – 19.10.2026
 - Echtes Schwärzen: Werkzeuge › Schwärzungen anwenden (⇧⌘R) entfernt den Inhalt unter den Markierungen endgültig – Text zeichenweise (der Rest der Zeile bleibt exakt stehen), Bilder pixelweise, Linien ganz oder beschnitten, Anmerkungen im Bereich; die Datei wird ohne Altstände neu geschrieben
 - Schwärzungs-Markierungen zeigen vor dem Anwenden durchscheinend mit rotem Rand, was entfernt wird; nach dem Anwenden steht eine echte schwarze Fläche in der Seite
