@@ -674,17 +674,33 @@ final class PDFFile {
 
     /// Kleines eigenständiges PDF: eine Seite pro Inhalt, alle mit den Ressourcen der Originalseite.
     /// Bilder und Schriften stehen nur einmal drin – viel schneller als pro Element eine Kopie der ganzen Datei.
+    /// Ressourcen-Vorspann je Seite (alle Schriften, Bilder, Gruppen der Seite) – wird je Datei nur einmal serialisiert.
+    /// Ohne diesen Zwischenspeicher baut jede Vermessung bei großen Seiten (28 MB Ressourcen) die Datei neu: 359 Wörter = 350 s.
+    private var standaloneCache: [Int: (bytes: [UInt8], offs: [(Int, Int)], base: Int)] = [:]
+
     func standalone(pageObj: Int, contents: [[UInt8]], mediaBox: CGRect) -> Data? {
         let res = pageResources(pageObj)
-        let objs = closure(of: .dict(res)).sorted()
-        var out = Array("%PDF-1.7\n%\u{00E2}\u{00E3}\n".utf8)
-        var offs: [(Int, Int)] = []
+        var out: [UInt8]
+        var offs: [(Int, Int)]
+        let base: Int
+        if let c = standaloneCache[pageObj] { out = c.bytes; offs = c.offs; base = c.base }
+        else {
+            let objs = closure(of: .dict(res)).sorted()
+            out = Array("%PDF-1.7\n%\u{00E2}\u{00E3}\n".utf8)
+            offs = []
+            for n in objs {
+                guard let o = object(n) else { continue }
+                offs.append((n, out.count))
+                out += Array("\(n) 0 obj\n".utf8); out += PDFWriter.serialize(o); out += Array("\nendobj\n".utf8)
+            }
+            base = max(maxObj, objs.last ?? 0) + 1
+            if standaloneCache.count > 8 { standaloneCache.removeAll() }
+            standaloneCache[pageObj] = (out, offs, base)
+        }
         func emit(_ n: Int, _ o: PDFObj) {
             offs.append((n, out.count))
             out += Array("\(n) 0 obj\n".utf8); out += PDFWriter.serialize(o); out += Array("\nendobj\n".utf8)
         }
-        for n in objs { if let o = object(n) { emit(n, o) } }
-        let base = max(maxObj, objs.last ?? 0) + 1
         let cat = base, pages = base + 1, resNum = base + 2
         emit(resNum, .dict(res))
         let mb: PDFObj = .array([.real(Double(mediaBox.minX)), .real(Double(mediaBox.minY)), .real(Double(mediaBox.maxX)), .real(Double(mediaBox.maxY))])

@@ -139,7 +139,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     /// Nach einem Eingriff in den Seiteninhalt: neues PDFDocument einhängen, Seite/Zoom/Position behalten
     /// Nach dem Öffnen: Scan ohne Textebene → einmal anbieten
     func offerOCRIfScanned() {
-        guard let d = wdoc, d.scanCandidate, let w = window, ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil, ProcessInfo.processInfo.environment["PDFW_REDACT_UITEST"] == nil, ProcessInfo.processInfo.environment["PDFW_OCR_UITEST"] == nil else { return }
+        guard let d = wdoc, d.scanCandidate, let w = window, ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil, ProcessInfo.processInfo.environment["PDFW_REDACT_UITEST"] == nil, ProcessInfo.processInfo.environment["PDFW_OCR_UITEST"] == nil, ProcessInfo.processInfo.environment["PDFW_COMPLEX_UITEST"] == nil else { return }
         d.scanCandidate = false
         let a = NSAlert()
         a.messageText = "Gescanntes Dokument ohne Textebene"

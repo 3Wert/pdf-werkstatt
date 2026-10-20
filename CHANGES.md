@@ -1,5 +1,10 @@
 # Änderungen
 
+## 1.6.1 – 20.10.2026
+- Lange Arbeiten (Seite vermessen, Inhalt ändern, Schwärzen, Prüfung) laufen im Hintergrund mit Fortschrittsfenster – die App hängt nicht mehr
+- Seiten, deren Text aus Kurven besteht (so schreibt macOS Dateien mit nicht übernehmbaren Schriften), melden klar, was geht und was nicht, statt still nichts zu tun
+- Doppelklick auf Text in sehr großen Dateien (> 12 MB) löst keine Gruppen mehr auf (vorher 13 s pro Klick), sondern deckt ab und setzt ein Textfeld – auch für erkannten Text auf Scans
+
 ## 1.6 – 20.10.2026
 - Passwortgeschützte PDFs: Lesen (RC4, AES-128, AES-256) und Schreiben (AES-256) jetzt im eigenen Leser/Schreiber – beim Sichern bleibt der Originalinhalt erhalten, auch bei Browser-Ausdrucken; PDFKit hatte verschlüsselte Dateien bisher komplett neu gerendert
 - Schwärzungen anwenden: Haken „Metadaten entfernen“ (Titel, Autor, Programm, Zeiten, XMP) – standardmäßig an, wird gemerkt

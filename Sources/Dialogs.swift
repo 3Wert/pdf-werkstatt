@@ -48,6 +48,30 @@ enum Dialogs {
         return a.runModal() == .alertFirstButtonReturn ? f.stringValue : nil
     }
 
+    // MARK: Lange Arbeiten mit Fortschrittsanzeige
+
+    /// Führt `work` im Hintergrund aus. Dauert es länger als 0,4 s, erscheint ein Fenster „… läuft“, die Oberfläche bleibt bedienbar
+    /// (modal), nichts hängt. `work` darf PDFKit-Objekte des Dokuments nicht anfassen – nur Bytes und eigene Strukturen.
+    static func busy<T>(window: NSWindow?, title: String, work: @escaping () -> T) -> T {
+        var result: T?
+        let sem = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async { result = work(); sem.signal() }
+        if sem.wait(timeout: .now() + 0.4) == .success { return result! }
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 84), styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = "PDF-Werkstatt"
+        let label = NSTextField(labelWithString: title)
+        label.frame = NSRect(x: 20, y: 48, width: 320, height: 20)
+        let bar = NSProgressIndicator(frame: NSRect(x: 20, y: 22, width: 320, height: 18))
+        bar.isIndeterminate = true; bar.startAnimation(nil)
+        panel.contentView?.addSubview(label); panel.contentView?.addSubview(bar)
+        if let w = window { panel.setFrameOrigin(NSPoint(x: w.frame.midX - 180, y: w.frame.midY - 42)) } else { panel.center() }
+        let session = NSApp.beginModalSession(for: panel)
+        while sem.wait(timeout: .now() + 0.05) != .success { NSApp.runModalSession(session) }
+        NSApp.endModalSession(session)
+        panel.orderOut(nil)
+        return result!
+    }
+
     // MARK: Texterkennung
 
     static func ocr(window: NSWindow, controller wc: MainWindowController, auto: Bool) {

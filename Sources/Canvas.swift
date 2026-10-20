@@ -125,10 +125,25 @@ final class Canvas: PDFView, NSTextViewDelegate {
         guard let d = document, let data = wdoc?.currentData() else { return nil }
         let idx = d.index(for: page)
         let t0 = Date()
-        guard let f = try? PDFFile(data: data), let m = PageContentModel.load(file: f, pageIndex: idx, reuse: contentCache[idx]) else { contentUnsupported(); return nil }
+        let reuse = contentCache[idx]
+        let m = Dialogs.busy(window: window, title: "Seite \(idx + 1) wird vermessen …") { (try? PDFFile(data: data)).flatMap { PageContentModel.load(file: $0, pageIndex: idx, reuse: reuse) } }
+        guard let m else { contentUnsupported(); return nil }
         if contentCache[idx] !== m { Log.v("Seite \(idx + 1) vermessen: \(m.elements.count) Elemente, \(Int(Date().timeIntervalSince(t0) * 1000)) ms") }
         contentCache[idx] = m
+        if let note = m.note { contentTooComplex(page: idx, note: note); return nil }
         return m
+    }
+
+    private var complexShown = Set<Int>()
+    /// Seite mit Zehntausenden Elementen (Text als Kurven): direktes Bearbeiten geht nicht – sagen statt hängen
+    private func contentTooComplex(page idx: Int, note: String) {
+        guard !complexShown.contains(idx), let w = window else { return }
+        complexShown.insert(idx)
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Seite \(idx + 1) lässt sich nicht direkt bearbeiten"
+        a.informativeText = "\(note). Der Text dieser Seite besteht aus Kurven statt Schrift – so schreibt macOS Dateien, deren Schriften es nicht übernehmen kann.\n\nWas geht: Abdecken und neuen Text setzen, Anmerkungen, Schwärzen (die Seite wird dabei als Bild geschrieben), Texterkennung für die Suche."
+        a.beginSheetModal(for: w)
     }
 
     /// Aktuelle Seite schon im Hintergrund vermessen, damit der erste Klick sofort reagiert
@@ -149,7 +164,8 @@ final class Canvas: PDFView, NSTextViewDelegate {
     }
 
     private func applyContent(_ m: PageContentModel, _ edits: [ContentStream.Edit], action: String) -> Bool {
-        guard let fresh = wdoc?.currentData(), let out = m.apply(edits, to: fresh) else {
+        guard let fresh = wdoc?.currentData() else { NSSound.beep(); return false }
+        guard let out = Dialogs.busy(window: window, title: "\(action) …", work: { m.apply(edits, to: fresh) }) else {
             NSSound.beep(); Log.w("Inhalt ändern fehlgeschlagen (\(action))"); return false
         }
         wdoc?.replaceData(out, old: fresh, action: action)
@@ -227,6 +243,11 @@ final class Canvas: PDFView, NSTextViewDelegate {
         if ks.isEmpty {
             let union = rects.reduce(CGRect.null) { $0.union($1) }
             let forms = m.elements.indices.filter { m.elements[$0].kind == .form && m.elements[$0].bounds.intersects(union) }
+            if !forms.isEmpty, (wdoc?.currentData()?.count ?? 0) > 12_000_000 {
+                // Gruppen auflösen hieße die ganze Datei neu schreiben (hier > 12 MB, >10 s) – der Aufrufer deckt stattdessen ab und setzt neu
+                Log.w("Text bearbeiten: Gruppen nicht aufgelöst (Datei \((wdoc?.currentData()?.count ?? 0) / 1_000_000) MB) – Rückfall auf Abdecken")
+                return false
+            }
             guard !forms.isEmpty, applyContent(m, forms.map { .dissolve($0) }, action: "Gruppe auflösen"),
                   let np = document?.page(at: idx), let nm = contentModel(for: np) else { return false }
             m = nm
@@ -274,9 +295,12 @@ final class Canvas: PDFView, NSTextViewDelegate {
         if paint { for (w, i) in objs { doc.page(at: i)?.removeAnnotation(w) } }
         d.touch()
         guard let fresh = d.currentData() else { d.restore(old); return nil }
+        Log.w("applyRedaction: Stand vorher \(old.count) B (Anmerkungen auf Seite 1: \(doc.page(at: 0)?.annotations.count ?? -1) nach Entfernen), frisch \(fresh.count) B, Generation \(d.generation)")
         var red = Redactor(marks: marks)
         red.stripMetadata = paint && prefs.object(forKey: "schwaerzenMetadaten") as? Bool ?? true
-        guard var out = red.apply(to: fresh, paintBoxes: paint) else {
+        let strip = red.stripMetadata
+        let firstTry = Dialogs.busy(window: window, title: "\(action) …") { red.apply(to: fresh, paintBoxes: paint) }
+        guard var out = firstTry else {
             Log.w("Schwärzen fehlgeschlagen: \(red.report.notes.joined(separator: "; "))")
             d.restore(old); return nil
         }
@@ -291,20 +315,21 @@ final class Canvas: PDFView, NSTextViewDelegate {
             }
             return out
         }
-        var found = leaks(out)
+        var found = Dialogs.busy(window: window, title: "Prüfung …") { leaks(out) }
         if !found.isEmpty {
             // Letzte Stufe: betroffene Seiten als Bild
             Log.w("Schwärzen: Text noch auffindbar (\(found.joined(separator: "; "))) – Seiten werden als Bild geschrieben")
-            red = Redactor(marks: marks, forceRaster: true)
-            red.stripMetadata = paint && prefs.object(forKey: "schwaerzenMetadaten") as? Bool ?? true
-            if let out2 = red.apply(to: fresh, paintBoxes: paint) {
-                out = out2; report = red.report
-                found = leaks(out)
+            let r2 = Redactor(marks: marks, forceRaster: true)
+            r2.stripMetadata = strip
+            if let out2 = Dialogs.busy(window: window, title: "Seiten werden als Bild geschrieben …", work: { r2.apply(to: fresh, paintBoxes: paint) }) {
+                red = r2; out = out2; report = red.report
+                found = Dialogs.busy(window: window, title: "Prüfung …") { leaks(out) }
             }
         }
         report.leaks = found
         report.annotationsRemoved = annots
-        let diffs = red.checkAppearance(before: fresh, after: out)
+        let redF = red, outF = out
+        let diffs = Dialogs.busy(window: window, title: "Darstellung wird verglichen …") { redF.checkAppearance(before: fresh, after: outF) }
         for (p, n) in diffs.sorted(by: { $0.key < $1.key }) where n > 60 { report.notes.append("Seite \(p + 1): Darstellung außerhalb der Schwärzung weicht an \(n) Pixeln ab") }
         d.replaceData(out, old: old, action: action)
         contentCache.removeAll()

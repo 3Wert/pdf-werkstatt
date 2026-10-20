@@ -306,8 +306,17 @@ final class Redactor {
             }
             // 1. Gruppen (Form-XObjects) im Bereich auflösen, damit ihr Inhalt einzeln greifbar ist
             var rounds = 0
-            while rounds < 4 {
+            var tooBig = false
+            while rounds < 4 && model.note == nil {
                 let forms = model.elements.indices.filter { k in model.elements[k].kind == .form && rects.contains { model.coverage(k, by: $0) > 0.01 } }
+                // Riesige Gruppen (Text als Kurven, Megabytes je Gruppe) nicht auflösen – das hieße die ganze Datei neu schreiben und
+                // Zehntausende Elemente vermessen (Minuten). Die Seite geht dann direkt den sicheren Weg als Bild.
+                let xo = file.resolve(file.pageResources(pages[pageIndex])["XObject"] ?? .null).dictValue ?? [:]
+                let formBytes = forms.reduce(0) { acc, k in
+                    if case .stream(_, let raw)? = xo[model.elements[k].name].map({ file.resolve($0) }) { return acc + raw.count }
+                    return acc
+                }
+                if formBytes > 1_000_000 { tooBig = true; break }
                 guard !forms.isEmpty, let d = model.apply(forms.map { .dissolve($0) }, to: cur), let nf = try? PDFFile(data: d),
                       let nm = PageContentModel.load(file: nf, pageIndex: pageIndex, reuse: nil) else { break }
                 report.formsDissolved += forms.count
@@ -319,13 +328,17 @@ final class Redactor {
             var resChanged = false
             var edits: [ContentStream.Edit] = []
             var needRaster = forceRaster
+            if model.note != nil || tooBig {
+                needRaster = true
+                report.notes.append("Seite \(pageIndex + 1): \(model.note ?? "Gruppen mit \(tooBig ? "Megabytes an Kurven" : "")") – Text besteht aus Kurven, Seite wird als Bild geschrieben")
+            }
             var zones = pageMarks.map { $0.rect }
             let color = pageMarks.first?.color ?? RGBA(.black)
 
             // Unsichtbarer oder weißer Text (z. B. Texterkennungs-Ebene über Scans) hinterlässt beim Vermessen keine Pixel.
             // Solche Textstücke noch einmal mit erzwungener Sichtbarkeit vermessen – gerade sie sind das Leck.
             var boundsOf: [Int: CGRect] = [:]
-            let hidden = model.elements.indices.filter { model.elements[$0].kind == .text && !model.elements[$0].bounds.isUsable }
+            let hidden = needRaster ? [] : model.elements.indices.filter { model.elements[$0].kind == .text && !model.elements[$0].bounds.isUsable }
             if !hidden.isEmpty {
                 var variants = [model.stream.render(model.elements.indices.map { .remove($0) })]
                 for k in hidden {

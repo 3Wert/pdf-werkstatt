@@ -14,6 +14,10 @@ extension Canvas {
 /// Selbsttest: PDFW_SELFTEST=<Ordner> – bearbeitet das erste Dokument per Skript, macht Fensterbilder und speichert.
 enum SelfTest {
     static func runIfRequested() {
+        if let dir = ProcessInfo.processInfo.environment["PDFW_COMPLEX_UITEST"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { complexUI(dir) }
+            return
+        }
         if let dir = ProcessInfo.processInfo.environment["PDFW_OCR_UITEST"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { ocrUI(dir) }
             return
@@ -24,6 +28,40 @@ enum SelfTest {
         }
         guard let dir = ProcessInfo.processInfo.environment["PDFW_SELFTEST"] else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { step(dir) }
+    }
+
+    /// PDFW_COMPLEX_UITEST=<Ordner> datei.pdf – Seite aus Zehntausenden Kurven: klare Meldung statt Hängen, Schwärzen mit Fortschritt
+    static func complexUI(_ dir: String) {
+        guard let doc = NSDocumentController.shared.documents.first as? WDocument, let wc = doc.controller, let w = wc.window else { return }
+        NSApp.activate(ignoringOtherApps: true); w.makeKeyAndOrderFront(nil)
+        let c = wc.canvas
+        func page() -> PDFPage { doc.pdf.page(at: 0)! }
+        func closeSheet() { if let s = w.attachedSheet { w.endSheet(s) } }
+        run([
+            { closeSheet()      // OCR-Angebot
+              let t0 = Date(); c.tool = .editText
+              let hit = c.selectContent(at: CGPoint(x: 300, y: 500), on: page())
+              note("Klick im Inhalts-Editor: Treffer \(hit) (Gruppe), Dauer \(Int(Date().timeIntervalSince(t0) * 1000)) ms mit Fortschrittsfenster") },
+            { closeSheet()
+              let t0 = Date(); let hit = c.selectContent(at: CGPoint(x: 300, y: 400), on: page())
+              note("zweiter Klick: Treffer \(hit), Dauer \(Int(Date().timeIntervalSince(t0) * 1000)) ms (aus dem Zwischenspeicher)")
+              // Texterkennung auf Seite 1, dann Doppelklick auf erkannten Text: kein Auflösen der Gruppen (> 12 MB), stattdessen Abdecken + Textfeld
+              if let fresh = doc.currentData(), let (ocrOut, rep) = OCR.apply(to: fresh, pages: [0]) { doc.replaceData(ocrOut, old: fresh, action: "Text erkennen"); note("OCR: \(rep.summary)") }
+              if let sel = doc.pdf.findString("Gewerberaum", withOptions: []).first {
+                  let r = sel.bounds(for: page()); let t0 = Date()
+                  c.convertToEditable(sel, page: page(), caretAt: CGPoint(x: r.midX, y: r.midY))
+                  note("Doppelklick auf OCR-Text: Dauer \(Int(Date().timeIntervalSince(t0) * 1000)) ms (unter 2 s erwartet), Textfelder: \(page().annotations.filter { ($0 as? WObject)?.model.kind == .text }.count) (1 erwartet), Abdeckungen: \(page().annotations.filter { ($0 as? WObject)?.model.kind == .cover }.count) (1 erwartet)")
+                  c.endEditing()
+              } else { note("OCR-Text „Gewerberaum“ nicht gefunden – Doppelklick übersprungen") } },
+            { c.tool = .textSelect
+              var m = Defaults.newModel(.cover); m.fill = RGBA(.black); m.redact = true
+              c.add(WObject(model: m, bounds: CGRect(x: 100, y: 500, width: 200, height: 30)), to: page(), action: "Schwärzen")
+              let t0 = Date(); let ok = wc.applyRedactions(confirm: false)
+              note("Schwärzen: \(ok ? "ok" : "FEHLER"), Dauer \(Int(Date().timeIntervalSince(t0) * 1000)) ms") },
+            { closeSheet(); shot(wc, dir + "/complex-1.png")
+              let s = page().selection(for: CGRect(x: 102, y: 502, width: 196, height: 26))?.string ?? ""
+              note("Text im geschwärzten Bereich: „\(s.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))“ (leer erwartet)") },
+        ]) { finish(dir) }
     }
 
     /// PDFW_OCR_UITEST=<Ordner> scan.pdf – Texterkennung über den Fenster-Controller (Fortschritt, Einsetzen, Widerrufen, Sichern)
