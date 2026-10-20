@@ -1,5 +1,10 @@
 # Änderungen
 
+## 1.4 – 20.10.2026
+- Sichern behält den Originalinhalt unveränderter Seiten: Text bleibt durchsuch- und kopierbar, auch bei Browser-Ausdrucken (Chrome/Skia, Type3-Schriften) – PDFKit hatte ihn bisher beim Sichern in Pfade verwandelt. Darstellung pixelgleich, Datei meist kleiner
+- Der eigene PDF-Leser versteht jetzt xref-Streams, Objektströme, Hybrid-Dateien sowie ASCII85-/ASCIIHex-Filter
+- Schwärzen arbeitet dadurch auf dem Original-Inhalt: Type3-Schriften werden zeichenweise entfernt (Vermessung über Vorschub statt Textmodus), Bilder mit weißer Fläche bleiben deckend, Flächen landen auch bei Skia-Dateien an der richtigen Stelle
+
 ## 1.3.1 – 20.10.2026
 - Schwärzen: unsichtbarer Text (Texterkennungs-Ebene über Scans) und weißer Text unter der Markierung wird jetzt ebenfalls entfernt – in 1.3 blieb er bei Scans in der Datei
 - Schwärzen: neue Prüfung, unabhängig von der Art des Inhalts – das Ergebnis wird ohne die schwarzen Flächen gerendert, unter jeder Markierung darf nichts mehr zu sehen sein; sonst wird die Seite als Bild geschrieben. Fängt z. B. Text, der als Vektorpfade gezeichnet ist (Formulare, Druckvorlagen)

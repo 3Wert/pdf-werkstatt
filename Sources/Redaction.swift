@@ -61,6 +61,30 @@ struct FontMetrics {
     }
     func bytes(_ code: Int) -> [UInt8] { twoByte ? [UInt8(code >> 8 & 0xFF), UInt8(code & 0xFF)] : [UInt8(code & 0xFF)] }
 
+    /// Breiten der Standard-14-Schriften aus den macOS-Pendants (Helvetica, Times, Symbol sind metrisch identisch mit den Adobe-AFMs)
+    static func standard14Widths(base: String, encoding: String) -> [Int: Double]? {
+        let b = base.lowercased()
+        let bold = b.contains("bold"), italic = b.contains("italic") || b.contains("oblique")
+        var name: String
+        if b.hasPrefix("helvetica") || b.hasPrefix("arial") { name = bold && italic ? "Helvetica-BoldOblique" : bold ? "Helvetica-Bold" : italic ? "Helvetica-Oblique" : "Helvetica" }
+        else if b.hasPrefix("times") { name = bold && italic ? "Times-BoldItalic" : bold ? "Times-Bold" : italic ? "Times-Italic" : "Times-Roman" }
+        else if b.hasPrefix("symbol") { name = "Symbol" }
+        else if b.hasPrefix("zapf") { name = "ZapfDingbats" }
+        else { return nil }
+        guard let font = NSFont(name: name, size: 1000) else { return nil }
+        let ct = font as CTFont
+        let strEnc: String.Encoding = encoding == "MacRomanEncoding" ? .macOSRoman : .windowsCP1252
+        var out: [Int: Double] = [:]
+        for code in 32...255 {
+            guard let s = String(bytes: [UInt8(code)], encoding: strEnc), let u = s.unicodeScalars.first else { continue }
+            var ch = [UniChar](String(u).utf16)
+            var g = [CGGlyph](repeating: 0, count: ch.count)
+            guard CTFontGetGlyphsForCharacters(ct, &ch, &g, ch.count), g[0] != 0 else { continue }
+            out[code] = CTFontGetAdvancesForGlyphs(ct, .horizontal, g, nil, 1)
+        }
+        return out.isEmpty ? nil : out
+    }
+
     init?(font: [String: PDFObj], file f: PDFFile) {
         let sub = f.resolve(font["Subtype"] ?? .null).nameValue ?? ""
         if sub == "Type0" {
@@ -93,10 +117,13 @@ struct FontMetrics {
         }
         if let desc = f.resolve(font["FontDescriptor"] ?? .null).dictValue, let mw = f.resolve(desc["MissingWidth"] ?? .null).doubleValue { defaultWidth = mw * scale }
         guard let ws = f.resolve(font["Widths"] ?? .null).arrayValue else {
-            // Standard-14 ohne Breiten: nur Courier ist sicher bekannt
-            let base = f.resolve(font["BaseFont"] ?? .null).nameValue ?? ""
+            // Standard-14 ohne Breiten (reportlab, alte Erzeuger): Breiten der metrisch gleichen macOS-Schriften über CoreText
+            let base = (f.resolve(font["BaseFont"] ?? .null).nameValue ?? "").split(separator: "+").last.map(String.init) ?? ""
             if base.hasPrefix("Courier") { defaultWidth = 600; return }
-            return nil
+            let enc = f.resolve(font["Encoding"] ?? .null).nameValue ?? (f.resolve(font["Encoding"] ?? .null).dictValue.flatMap { f.resolve($0["BaseEncoding"] ?? .null).nameValue }) ?? "StandardEncoding"
+            guard let table = FontMetrics.standard14Widths(base: base, encoding: enc) else { return nil }
+            widths = table
+            return
         }
         let first = f.resolve(font["FirstChar"] ?? .int(0)).intValue ?? 0
         for (k, v) in ws.enumerated() { if let d = f.resolve(v).doubleValue { widths[first + k] = d * scale } }
@@ -166,6 +193,48 @@ enum RedactRaster {
             if imgs[0][i] < 240 { ink += 1 }
         }
         return (diff, ink)
+    }
+
+    /// Vergleich zweier Varianten mit Zonen: (abweichende Pixel außerhalb der Zonen, Tinte von b innerhalb der Zonen, Tinte von a gesamt)
+    static func compare(file f: PDFFile, pageObj: Int, mediaBox: CGRect, a: [UInt8], b: [UInt8], scale: CGFloat, zones: [CGRect]) -> (Int, Int, Int)? {
+        let w = Int(ceil(mediaBox.width * scale)), h = Int(ceil(mediaBox.height * scale))
+        guard w > 0, h > 0, w * h < 12_000_000,
+              let data = f.standalone(pageObj: pageObj, contents: [a, b], mediaBox: mediaBox),
+              let prov = CGDataProvider(data: data as CFData), let doc = CGPDFDocument(prov) else { return nil }
+        var imgs: [[UInt8]] = []
+        for i in 1...2 {
+            guard let pg = doc.page(at: i),
+                  let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue),
+                  let buf = ctx.data?.bindMemory(to: UInt8.self, capacity: w * h) else { return nil }
+            ctx.setFillColor(gray: 1, alpha: 1); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.scaleBy(x: scale, y: scale); ctx.translateBy(x: -mediaBox.minX, y: -mediaBox.minY)
+            ctx.drawPDFPage(pg)
+            imgs.append(Array(UnsafeBufferPointer(start: buf, count: w * h)))
+        }
+        // Zonen in Pixel (etwas großzügig, Antialiasing)
+        let zpx = zones.map { z -> (Int, Int, Int, Int) in
+            let r = z.insetBy(dx: -1, dy: -1)
+            return (Int((r.minX - mediaBox.minX) * scale), Int((mediaBox.maxY - r.maxY) * scale), Int(((r.maxX - mediaBox.minX) * scale).rounded(.up)), Int(((mediaBox.maxY - r.minY) * scale).rounded(.up)))
+        }
+        var diffOut = 0, inkIn = 0, inkTotal = 0
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = y * w + x
+                let inZone = zpx.contains { x >= $0.0 && x <= $0.2 && y >= $0.1 && y <= $0.3 }
+                if imgs[0][i] < 240 { inkTotal += 1 }
+                if inZone { if imgs[1][i] < 200 { inkIn += 1 } }
+                else if abs(Int(imgs[0][i]) - Int(imgs[1][i])) > 24 {
+                    // Subpixel-Versatz (Rundung der Breiten auf 1/1000) ist kein Verrutschen: Nachbarpixel in beide Richtungen zulassen
+                    let a = Int(imgs[0][i]), b = Int(imgs[1][i])
+                    var near = false
+                    for dx in [-1, 1] where x + dx >= 0 && x + dx < w {
+                        if abs(a - Int(imgs[1][i + dx])) <= 40 || abs(b - Int(imgs[0][i + dx])) <= 40 { near = true; break }
+                    }
+                    if !near { diffOut += 1 }
+                }
+            }
+        }
+        return (diffOut, inkIn, inkTotal)
     }
 
     /// Ganze Seite (ohne Anmerkungen) als Graubild – für den Vorher/Nachher-Vergleich
@@ -284,13 +353,13 @@ final class Redactor {
                     else if let snip = clippedPath(e, stream: model.stream, mediaBox: model.mediaBox, rects: rects) { edits.append(.replace(k, snip)); report.pathsClipped += 1 }
                 case .image, .inlineImage, .shading, .form:
                     if cov >= 0.98 { edits.append(.remove(k)); report.imagesRemoved += 1; zones.append(e.bounds); continue }
-                    if let (snip, name, obj) = rasterizeElement(k, model: model, file: file, pageObj: pageObj, rects: rects, color: color, resources: resources) {
+                    if let (snip, name, obj, box) = rasterizeElement(k, model: model, file: file, pageObj: pageObj, rects: rects, color: color, resources: resources) {
                         edits.append(.replace(k, snip))
                         var xo = file.resolve(resources["XObject"] ?? .dict([:])).dictValue ?? [:]
                         xo[name] = obj
                         resources["XObject"] = .dict(xo); resChanged = true
                         report.imagesRedacted += 1
-                        zones.append(e.bounds.insetBy(dx: -1.5, dy: -1.5))
+                        zones.append(box.insetBy(dx: -2, dy: -2))
                     } else { needRaster = true; report.notes.append("Seite \(pageIndex + 1): Bild ließ sich nicht neu schreiben – Seite wird als Bild geschrieben") }
                 }
             }
@@ -317,7 +386,7 @@ final class Redactor {
                 if resChanged { extra["Resources"] = .dict(resources) }
             }
             pending.append(PendingPage(pageIndex: pageIndex, pageObj: pageObj, content: content, extra: extra, marks: pageMarks, color: color,
-                                       rastered: needRaster, mediaBox: model.mediaBox, openStates: model.stream.openStates, endsInText: model.stream.endsInText))
+                                       rastered: needRaster, mediaBox: model.mediaBox, openStates: model.stream.openStates, endsInText: model.stream.endsInText, endCTM: model.stream.endCTM))
             report.changedZones[pageIndex] = zones
         }
 
@@ -348,10 +417,14 @@ final class Redactor {
                     if pp.endsInText { content += Array("ET\n".utf8) }
                     for _ in 0..<pp.openStates { content += Array("Q\n".utf8) }
                 }
+                let det = pp.endCTM.a * pp.endCTM.d - pp.endCTM.b * pp.endCTM.c
+                let inv = (!pp.rastered && det != 0) ? pp.endCTM.inverted() : .identity
+                content += Array("q \(fmt(inv.a)) \(fmt(inv.b)) \(fmt(inv.c)) \(fmt(inv.d)) \(fmt(inv.tx)) \(fmt(inv.ty)) cm\n".utf8)
                 for m in pp.marks {
                     let r = m.rect
-                    content += Array("q \(fmt(m.color.r)) \(fmt(m.color.g)) \(fmt(m.color.b)) rg \(fmt(r.minX)) \(fmt(r.minY)) \(fmt(r.width)) \(fmt(r.height)) re f Q\n".utf8)
+                    content += Array("\(fmt(m.color.r)) \(fmt(m.color.g)) \(fmt(m.color.b)) rg \(fmt(r.minX)) \(fmt(r.minY)) \(fmt(r.width)) \(fmt(r.height)) re f\n".utf8)
                 }
+                content += Array("Q\n".utf8)
             }
             updates[pp.pageObj] = (content, pp.extra)
         }
@@ -379,6 +452,7 @@ final class Redactor {
         var rastered: Bool
         var mediaBox: CGRect
         var openStates: Int, endsInText: Bool
+        var endCTM = CGAffineTransform.identity
     }
 
     /// Pixel je Seite, die innerhalb der Markierungen weder leer noch Schwärzungsfarbe sind
@@ -478,36 +552,33 @@ final class Redactor {
         guard !glyphs.isEmpty else { return .unchanged }
         let prefix = op == "'" ? "T* " : op == "\"" ? "\(fmt(aw)) Tw \(fmt(ac)) Tc T* " : ""
 
-        /// Variante: nur die Zeichen in `visible` sichtbar (für Vermessung immer schwarz und gefüllt), Rest mit Tr 3
+        /// Vorschub eines Zeichens in 1/1000 Textraum (Breite + Zeichen-/Wortabstand), so wie es ein TJ-Array ersetzen kann
+        func advance(_ c: Int) -> Double { metrics.width(c) + (tc + (metrics.wordSpaceApplies && c == 32 ? tw : 0)) * 1000 / st.size }
+
+        /// Variante: nur die Zeichen in `visible` werden gezeichnet, alle anderen durch ihren Vorschub ersetzt.
+        /// Unabhängig vom Textmodus – bei Type3-Schriften wirkt `3 Tr` nicht.
         func variant(visible: Set<Int>, forceVisible: Bool) -> [UInt8] {
             var out = Array(prefix.utf8)
-            var run: [TJItem] = []
-            var runVisible: Bool? = nil
+            if forceVisible { out += Array("0 Tr 0 g 0 G ".utf8) }
+            var items2: [TJItem] = []
+            var buf: [UInt8] = []
+            var adj = 0.0
+            func flushBuf() { if !buf.isEmpty { items2.append(.str(buf)); buf = [] } }
+            func flushAdj() { if adj != 0 { items2.append(.adj(adj)); adj = 0 } }
             var g = 0
-            func flush() {
-                guard !run.isEmpty, let v = runVisible else { return }
-                let tr = v ? (forceVisible ? 0 : st.tr) : 3
-                out += Array("\(tr) Tr ".utf8)
-                if v && forceVisible { out += Array("0 g 0 G ".utf8) }
-                out += serializeTJ(run, prefix: "")
-                out += Array(" ".utf8)
-                run = []
-            }
             for it in items {
                 switch it {
-                case .adj: run.append(it)
+                case .adj(let d): flushBuf(); adj += d
                 case .str(let s):
                     for c in metrics.codes(s) {
-                        let v = visible.contains(g); g += 1
-                        if runVisible != nil, runVisible != v { flush() }
-                        runVisible = v
-                        if case .str(var last)? = run.last, (run.count > 0) { last += metrics.bytes(c); run[run.count - 1] = .str(last) }
-                        else { run.append(.str(metrics.bytes(c))) }
+                        if visible.contains(g) { flushAdj(); buf += metrics.bytes(c) } else { flushBuf(); adj -= advance(c) }
+                        g += 1
                     }
                 }
             }
-            flush()
-            out += Array("\(st.tr) Tr".utf8)
+            flushBuf(); flushAdj()
+            out += serializeTJ(items2, prefix: "")
+            if forceVisible { out += Array(" \(st.tr) Tr".utf8) }
             return out
         }
 
@@ -536,38 +607,24 @@ final class Redactor {
         }
         guard !removed.isEmpty else { return .unchanged }
 
-        // 2. Neues TJ-Array: entfernte Zeichen werden zu Vorschub-Zahlen (Breite + Zeichen-/Wortabstand)
-        var newItems: [TJItem] = []
-        var buf: [UInt8] = []
-        var pendingAdj = 0.0
-        func flushBuf() { if !buf.isEmpty { newItems.append(.str(buf)); buf = [] } }
-        func flushAdj() { if pendingAdj != 0 { newItems.append(.adj(pendingAdj)); pendingAdj = 0 } }
-        var g = 0
-        for it in items {
-            switch it {
-            case .adj(let d): flushBuf(); pendingAdj += d
-            case .str(let s):
-                for c in metrics.codes(s) {
-                    if removed.contains(g) {
-                        flushBuf()
-                        let space = metrics.wordSpaceApplies && c == 32 ? tw : 0
-                        pendingAdj -= metrics.width(c) + (tc + space) * 1000 / st.size
-                    } else { flushAdj(); buf += metrics.bytes(c) }
-                    g += 1
-                }
-            }
-        }
-        flushBuf(); flushAdj()
-        let replacement = serializeTJ(newItems, prefix: prefix)
-
-        // 3. Nachweis: Rest steht pixelgenau da, wo er vorher stand
+        // 2. Neues TJ-Array: entfernte Zeichen werden zu Vorschub-Zahlen
         let kept = Set(glyphs.indices).subtracting(removed)
-        let expected = model.stream.render([.isolate(k), .replace(k, variant(visible: kept, forceVisible: false))])
+        let replacement = variant(visible: kept, forceVisible: false)
+
+        // 3. Nachweis: Original und Ersatz pixelgenau vergleichen – außerhalb der entfernten Zeichen darf sich nichts ändern,
+        //    innerhalb muss alles verschwunden sein. (Unabhängig von Schriftart und Textmodus.)
+        let original = model.stream.render([.isolate(k)])
         let actual = model.stream.render([.isolate(k), .replace(k, replacement)])
-        if let (diff, ink) = RedactRaster.difference(file: f, pageObj: pageObj, mediaBox: model.mediaBox, a: expected, b: actual, scale: 2) {
-            if diff > max(6, ink / 100) {
-                Log.w("Schwärzen: Zerlegung von „\(e.name)“ verschiebt Text (\(diff) px) – ganzes Stück entfernen")
-                return removed.count == glyphs.count || !e.canRemove ? .removeWhole : .removeWhole
+        if let (diffOutside, inkInside, inkTotal) = RedactRaster.compare(file: f, pageObj: pageObj, mediaBox: model.mediaBox, a: original, b: actual, scale: 2, zones: removedBoxes) {
+            if let dbg = ProcessInfo.processInfo.environment["PDFW_DEBUG_GLYPH"], e.name.hasPrefix(dbg) {
+                if let d = f.standalone(pageObj: pageObj, contents: [original, actual], mediaBox: model.mediaBox) { try? d.write(to: URL(fileURLWithPath: "/tmp/glyph-debug.pdf")) }
+                Log.w("Glyph-Debug „\(e.name)“: entfernt \(removed.sorted()) von \(glyphs.count), Kästen \(removedBoxes.map { $0.integral }), außerhalb \(diffOutside) innen \(inkInside) gesamt \(inkTotal)\nORIGINAL: \(String(decoding: model.stream.source(k), as: UTF8.self).prefix(300))\nERSATZ: \(String(decoding: replacement, as: UTF8.self).prefix(300))")
+            }
+            // Nur die Lage zählt: Entfernte Zeichen sind per Konstruktion weg, in ihre Kästen ragen aber Nachbarn hinein.
+            _ = inkInside
+            if diffOutside > max(6, inkTotal / 100) {
+                Log.w("Schwärzen: Zerlegung von „\(e.name)“ verschiebt den Rest (\(diffOutside) px) – ganzes Stück entfernen")
+                return .removeWhole
             }
         }
         return .replaced(replacement, removed.count, removedBoxes)
@@ -591,13 +648,22 @@ final class Redactor {
     // MARK: Bilder
 
     /// Bild (oder Verlauf/Gruppe) neu rastern: so, wie es auf der Seite erscheint, mit geschwärzten Pixeln. Liefert Ersatz-Snippet, Ressourcenname und Objektreferenz.
-    private func rasterizeElement(_ k: Int, model: PageContentModel, file f: PDFFile, pageObj: Int, rects: [CGRect], color: RGBA, resources: [String: PDFObj]) -> ([UInt8], String, PDFObj)? {
+    private func rasterizeElement(_ k: Int, model: PageContentModel, file f: PDFFile, pageObj: Int, rects: [CGRect], color: RGBA, resources: [String: PDFObj]) -> ([UInt8], String, PDFObj, CGRect)? {
         let e = model.elements[k]
         guard (e.ctm.a * e.ctm.d - e.ctm.b * e.ctm.c) != 0 else { return nil }
         let inv = e.ctm.inverted()
         let iso = model.stream.render([.isolate(k)])
         let blank = model.stream.render(model.elements.indices.map { .remove($0) })
-        guard let b = RedactRaster.bounds(file: f, pageObj: pageObj, mediaBox: model.mediaBox, variants: [blank, iso], scale: 2)[1], b.width > 0.5, b.height > 0.5 else { return nil }
+        // Bilder decken auch mit Weiß – deshalb der geometrische Kasten (Einheitsquadrat × CTM), nicht nur die „Tinte“
+        var b: CGRect
+        if e.kind == .image || e.kind == .inlineImage {
+            b = CGRect(x: 0, y: 0, width: 1, height: 1).applying(e.ctm).intersection(model.mediaBox.insetBy(dx: -1, dy: -1))
+        } else {
+            guard let ink = RedactRaster.bounds(file: f, pageObj: pageObj, mediaBox: model.mediaBox, variants: [blank, iso], scale: 2)[1] else { return nil }
+            b = ink
+        }
+        guard b.isUsable, b.width > 0.5, b.height > 0.5 else { return nil }
+        Log.v("Bild neu rastern: Element \(k) „\(e.name)“ grob \(e.bounds.integral) genau \(b.integral) ctm \(e.ctm)")
         // Auflösung: native Bildauflösung, 72…600 dpi
         var dpi: CGFloat = 300
         var wasJPEG = false
@@ -657,7 +723,7 @@ final class Redactor {
         // Das Snippet steht an der Stelle des alten Elements – dort gilt dessen CTM. Erst zurück in Seitenkoordinaten, dann platzieren.
         let m = CGAffineTransform(a: b.width, b: 0, c: 0, d: b.height, tx: b.minX, ty: b.minY).concatenating(inv)
         let snip = Array("q \(fmt(m.a)) \(fmt(m.b)) \(fmt(m.c)) \(fmt(m.d)) \(fmt(m.tx)) \(fmt(m.ty)) cm /\(name) Do Q".utf8)
-        return (snip, name, .ref(n, 0))
+        return (snip, name, .ref(n, 0), b)
     }
 
     /// Letzte Stufe: ganze Seite als Bild (300 dpi) mit geschwärzten Flächen
@@ -748,7 +814,9 @@ enum RedactTest {
         let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".pdf") && !$0.contains(".geschwaerzt") }.sorted()
         for name in files {
             let url = URL(fileURLWithPath: dir).appendingPathComponent(name)
-            guard let doc = PDFDocument(url: url), let fresh = doc.dataRepresentation() else { lines.append("\(name): nicht ladbar"); ok = false; continue }
+            // Wie in der App: über WDocument, damit unveränderte Seiten ihren Originalinhalt behalten
+            let wd = WDocument()
+            guard let raw = try? Data(contentsOf: url), (try? wd.read(from: raw, ofType: "com.adobe.pdf")) != nil, let fresh = wd.currentData() else { lines.append("\(name): nicht ladbar"); ok = false; continue }
             let normalized = PDFDocument(data: fresh)!
             var marks: [RedactMark] = []
             var secrets: [String] = []
@@ -813,6 +881,47 @@ enum RedactTest {
         let text = lines.joined(separator: "\n")
         print(text)
         try? text.write(toFile: dir + "/Ergebnisse/schwaerzen-ergebnis.txt", atomically: true, encoding: .utf8)
+        exit(ok ? 0 : 1)
+    }
+}
+
+
+/// PDFW_SAVE_TEST=<Ordner>: jede PDF öffnen und ungeändert sichern – Text und Darstellung müssen erhalten bleiben.
+enum SaveTest {
+    static func runIfRequested() {
+        guard let dir = ProcessInfo.processInfo.environment["PDFW_SAVE_TEST"] else { return }
+        var ok = true
+        var lines: [String] = []
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".pdf") && !$0.contains(".geschwaerzt") && !$0.contains(".gesichert") }.sorted()
+        for name in files {
+            let url = URL(fileURLWithPath: dir).appendingPathComponent(name)
+            let t0 = Date()
+            let wd = WDocument()
+            guard let raw = try? Data(contentsOf: url), (try? wd.read(from: raw, ofType: "com.adobe.pdf")) != nil, let saved = try? wd.data(ofType: "com.adobe.pdf"),
+                  let before = PDFDocument(data: raw), let after = PDFDocument(data: saved) else { lines.append("FEHL \(name): nicht ladbar/sicherbar"); ok = false; continue }
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            var problems: [String] = []
+            if before.pageCount != after.pageCount { problems.append("Seitenzahl \(before.pageCount) → \(after.pageCount)") }
+            var textPages = 0, lostPages = 0, diffPx = 0
+            for i in 0..<min(before.pageCount, after.pageCount, 5) {
+                let a = (before.page(at: i)?.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let b = (after.page(at: i)?.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !a.isEmpty { textPages += 1; if b.count < a.count * 9 / 10 { lostPages += 1 } }
+                if let x = RedactRaster.pageGray(raw, pageIndex: i, scale: 1), let y = RedactRaster.pageGray(saved, pageIndex: i, scale: 1), x.w == y.w, x.h == y.h {
+                    for k in 0..<(x.w * x.h) where abs(Int(x.px[k]) - Int(y.px[k])) > 40 { diffPx += 1 }
+                }
+            }
+            if lostPages > 0 { problems.append("Text verloren auf \(lostPages) von \(textPages) Textseiten") }
+            if diffPx > 80 { problems.append("Darstellung weicht ab: \(diffPx) px") }
+            let eof = saved.ranges(of: "%%EOF".data(using: .utf8)!).count
+            try? saved.write(to: URL(fileURLWithPath: dir).appendingPathComponent("Ergebnisse").appendingPathComponent((name as NSString).deletingPathExtension + ".gesichert.pdf"))
+            if !problems.isEmpty { ok = false }
+            lines.append("\(problems.isEmpty ? "OK  " : "FEHL") \(name): \(raw.count / 1024) → \(saved.count / 1024) KB, \(ms) ms, EOF=\(eof), Textseiten \(textPages), Abweichung \(diffPx) px" + (problems.isEmpty ? "" : " ⚠️ " + problems.joined(separator: "; ")))
+        }
+        let text = lines.joined(separator: "\n")
+        print(text)
+        try? FileManager.default.createDirectory(atPath: dir + "/Ergebnisse", withIntermediateDirectories: true)
+        try? text.write(toFile: dir + "/Ergebnisse/sichern-ergebnis.txt", atomically: true, encoding: .utf8)
         exit(ok ? 0 : 1)
     }
 }

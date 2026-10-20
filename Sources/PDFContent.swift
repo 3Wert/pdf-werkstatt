@@ -33,6 +33,7 @@ enum PDFContentError: Error { case unsupported(String), parse(String) }
 struct PDFLexer {
     let b: [UInt8]
     var i: Int
+    var lastStreamData: [UInt8]? = nil
 
     init(_ bytes: [UInt8], at: Int = 0) { b = bytes; i = at }
 
@@ -140,6 +141,7 @@ struct PDFLexer {
                     }
                     skipWhite()
                     if i + 9 <= b.count, Array(b[i..<(i + 9)]) == Array("endstream".utf8) { i += 9 }
+                    lastStreamData = data
                     return .stream(d, data)
                 }
                 i = save
@@ -232,7 +234,9 @@ enum PDFWriter {
         case .bool(let b): out += Array((b ? "true" : "false").utf8)
         case .int(let i): out += Array(String(i).utf8)
         case .real(let r):
-            var s = String(format: "%.6f", r)      // 6 Stellen: Matrizen wie 0.8001272 dürfen beim Neuschreiben nicht verrutschen
+            // Übernommene Objekte (Muster-Matrizen mit 9 Nachkommastellen) müssen exakt bleiben – sonst verschieben sich Kacheln
+            if r == r.rounded() && abs(r) < 1e9 { out += Array(String(Int(r)).utf8); return }
+            var s = String(format: "%.9f", r)
             while s.hasSuffix("0") { s.removeLast() }
             if s.hasSuffix(".") { s.removeLast() }
             out += Array(s.utf8)
@@ -286,6 +290,34 @@ enum PDFFilters {
             cap *= 4
         }
         return nil
+    }
+
+    static func ascii85(_ data: [UInt8]) -> [UInt8]? {
+        var out: [UInt8] = []
+        var tuple: [UInt32] = []
+        var i = 0
+        if data.count >= 2, data[0] == 0x3C, data[1] == 0x7E { i = 2 }   // <~
+        while i < data.count {
+            let c = data[i]; i += 1
+            if PDFLexer.isWhite(c) { continue }
+            if c == 0x7E { break }                                       // ~>
+            if c == 0x7A && tuple.isEmpty { out += [0, 0, 0, 0]; continue }   // z
+            guard c >= 0x21, c <= 0x75 else { return nil }
+            tuple.append(UInt32(c) - 33)
+            if tuple.count == 5 {
+                var v: UInt32 = 0; for t in tuple { v = v &* 85 &+ t }
+                out += [UInt8(v >> 24), UInt8(v >> 16 & 0xFF), UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)]
+                tuple = []
+            }
+        }
+        if tuple.count > 1 {
+            let n = tuple.count
+            for _ in n..<5 { tuple.append(84) }
+            var v: UInt32 = 0; for t in tuple { v = v &* 85 &+ t }
+            let bytes = [UInt8(v >> 24), UInt8(v >> 16 & 0xFF), UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)]
+            out += bytes.prefix(n - 1)
+        }
+        return out
     }
 
     static func unpredict(_ data: [UInt8], predictor: Int, colors: Int, bpc: Int, columns: Int) -> [UInt8] {
@@ -347,18 +379,87 @@ final class PDFFile {
         maxObj = max(maxObj, (trailer["Size"]?.intValue ?? 1) - 1)
     }
 
-    /// Liest eine xref-Tabelle (klassisch). Liefert /Prev.
+    // MARK: Objekte aus einer anderen Datei übernehmen
+
+    /// Kopiert `root` samt allen erreichbaren Objekten aus `src` in diese Datei (Nummern ab `firstFree`).
+    /// Liefert das umnummerierte Wurzelobjekt und die neuen Objekte.
+    func imported(_ root: PDFObj, from src: PDFFile, firstFree: Int) -> (PDFObj, [(Int, PDFObj)]) {
+        var map: [Int: Int] = [:]
+        var next = firstFree
+        let nums = src.closure(of: root).sorted()
+        for n in nums { map[n] = next; next += 1 }
+        func renum(_ o: PDFObj) -> PDFObj {
+            switch o {
+            case .ref(let n, _): return map[n].map { .ref($0, 0) } ?? .null
+            case .array(let a): return .array(a.map(renum))
+            case .dict(let d): return .dict(d.mapValues(renum))
+            case .stream(let d, let raw): return .stream(d.mapValues(renum), raw)
+            default: return o
+            }
+        }
+        var objs: [(Int, PDFObj)] = []
+        for n in nums { if let o = src.object(n) { objs.append((map[n]!, renum(o))) } }
+        return (renum(root), objs)
+    }
+
+    /// Inkrementelle Aktualisierung: Seitenwörterbücher ersetzen (ohne neuen Inhaltsstrom) + neue Objekte
+    func updated(pageDicts: [Int: [String: PDFObj]], newObjects: [(Int, PDFObj)]) -> Data? {
+        var out = bytes
+        if out.last != 0x0A { out.append(0x0A) }
+        var newOffsets: [(Int, Int)] = []
+        func emit(_ n: Int, _ o: PDFObj) {
+            newOffsets.append((n, out.count))
+            out += Array("\(n) 0 obj\n".utf8); out += PDFWriter.serialize(o); out += Array("\nendobj\n".utf8)
+        }
+        for (n, o) in newObjects { emit(n, o) }
+        for (num, pd) in pageDicts.sorted(by: { $0.key < $1.key }) { emit(num, .dict(pd)) }
+        let xrefPos = out.count
+        out += Array("xref\n".utf8)
+        for (n, off) in newOffsets.sorted(by: { $0.0 < $1.0 }) { out += Array("\(n) 1\n".utf8); out += Array(String(format: "%010d 00000 n \n", off).utf8) }
+        var tr: [String: PDFObj] = [:]
+        for k in ["Root", "Info", "ID"] { if let v = trailer[k] { tr[k] = v } }
+        tr["Size"] = .int(max(maxObj, newObjects.map { $0.0 }.max() ?? 0) + 1)
+        tr["Prev"] = .int(startXref)
+        out += Array("trailer\n".utf8); out += PDFWriter.serialize(.dict(tr))
+        out += Array("\nstartxref\n\(xrefPos)\n%%EOF\n".utf8)
+        return Data(out)
+    }
+
+    /// Seitenwörterbuch einer Seite (aufgelöst)
+    func pageDict(_ num: Int) -> [String: PDFObj]? { object(num)?.dictValue }
+
+    /// MediaBox einer Seite (auch geerbt)
+    func mediaBox(ofPage num: Int) -> CGRect? {
+        var n: Int? = num; var seen = Set<Int>()
+        while let cur = n, !seen.contains(cur), let d = object(cur)?.dictValue {
+            seen.insert(cur)
+            if let a = resolve(d["MediaBox"] ?? .null).arrayValue, a.count == 4 {
+                let v = a.map { resolve($0).doubleValue ?? 0 }
+                return CGRect(x: min(v[0], v[2]), y: min(v[1], v[3]), width: abs(v[2] - v[0]), height: abs(v[3] - v[1]))
+            }
+            if case .ref(let pn, _)? = d["Parent"] { n = pn } else { n = nil }
+        }
+        return nil
+    }
+
+    /// Objekte in Objektströmen: Objektnummer → (Strom-Objektnummer, Index)
+    private var inStream: [Int: (Int, Int)] = [:]
+    private var objStmCache: [Int: [Int: PDFObj]] = [:]
+    /// true, wenn die Datei xref-Streams oder Objektströme benutzt (PDF 1.5+)
+    private(set) var usesStreams = false
+
+    /// Liest eine xref-Tabelle (klassisch) oder einen xref-Stream. Liefert /Prev.
     private func parseXref(at off: Int) throws -> Int? {
         var lx = PDFLexer(bytes, at: off)
         guard let tok = lx.readToken() else { throw PDFContentError.parse("xref") }
-        guard tok == "xref" else { throw PDFContentError.unsupported("xref-Stream") }
+        guard tok == "xref" else { return try parseXrefStream(at: off) }
         while true {
             lx.skipWhite()
             if lx.i + 7 <= bytes.count, Array(bytes[lx.i..<(lx.i + 7)]) == Array("trailer".utf8) {
                 lx.i += 7
                 guard case .dict(let d)? = try lx.parseObject() else { throw PDFContentError.parse("trailer") }
                 for (k, v) in d where trailer[k] == nil { trailer[k] = v }
-                if let xs = d["XRefStm"]?.intValue { _ = xs; throw PDFContentError.unsupported("Hybrid-xref") }
+                if let xs = d["XRefStm"]?.intValue { _ = try parseXrefStream(at: xs) }   // Hybrid: Einträge ergänzen
                 return d["Prev"]?.intValue
             }
             guard let s = lx.readToken(), let start = Int(s), let c = lx.readToken(), let count = Int(c) else { throw PDFContentError.parse("xref section") }
@@ -367,14 +468,67 @@ final class PDFFile {
                 guard let o = lx.readToken(), let g = lx.readToken(), let ty = lx.readToken() else { throw PDFContentError.parse("xref entry") }
                 _ = g
                 let num = start + k
-                if ty == "n", let ov = Int(o), offsets[num] == nil { offsets[num] = ov }
+                if ty == "n", let ov = Int(o), offsets[num] == nil, inStream[num] == nil { offsets[num] = ov }
                 maxObj = max(maxObj, num)
             }
         }
     }
 
+    /// xref-Stream (PDF 1.5): "n g obj << /Type /XRef /W [...] /Index [...] >> stream"
+    private func parseXrefStream(at off: Int) throws -> Int? {
+        usesStreams = true
+        var lx = PDFLexer(bytes, at: off)
+        guard let _ = lx.readToken(), let _ = lx.readToken(), let o = lx.readToken(), o == "obj",
+              case .stream(let d, _)? = try lx.parseObject(resolveLength: { [weak self] l in self?.resolve(l).intValue }) else { throw PDFContentError.parse("xref-Stream") }
+        guard let data = decoded(.stream(d, lx.lastStreamData ?? [])) ?? decodedXref(d, lx) else { throw PDFContentError.parse("xref-Stream Daten") }
+        guard let w = resolve(d["W"] ?? .null).arrayValue?.compactMap({ resolve($0).intValue }), w.count >= 3 else { throw PDFContentError.parse("xref /W") }
+        let size = resolve(d["Size"] ?? .int(0)).intValue ?? 0
+        var index: [Int] = resolve(d["Index"] ?? .null).arrayValue?.compactMap { resolve($0).intValue } ?? [0, size]
+        if index.count % 2 == 1 { index.removeLast() }
+        let rowLen = w.reduce(0, +)
+        var pos = 0
+        func field(_ k: Int) -> Int { var v = 0; for _ in 0..<w[k] { v = v << 8 | Int(data[pos]); pos += 1 }; return v }
+        var i = 0
+        while i + 1 < index.count {
+            let start = index[i], count = index[i + 1]; i += 2
+            for k in 0..<count {
+                guard pos + rowLen <= data.count else { break }
+                let type = w[0] == 0 ? 1 : field(0)
+                let f2 = field(1), _ = field(2)
+                let num = start + k
+                maxObj = max(maxObj, num)
+                guard offsets[num] == nil, inStream[num] == nil else { continue }
+                if type == 1 { offsets[num] = f2 } else if type == 2 { inStream[num] = (f2, k) }
+            }
+        }
+        for (k, v) in d where trailer[k] == nil && ["Root", "Info", "ID", "Encrypt", "Size"].contains(k) { trailer[k] = v }
+        return d["Prev"]?.intValue
+    }
+    private func decodedXref(_ d: [String: PDFObj], _ lx: PDFLexer) -> [UInt8]? { nil }
+
+    /// Objekt aus einem Objektstrom
+    private func objectFromStream(_ num: Int) -> PDFObj? {
+        guard let (sn, _) = inStream[num] else { return nil }
+        if objStmCache[sn] == nil {
+            var table: [Int: PDFObj] = [:]
+            if let so = object(sn), case .stream(let sd, _) = so, let data = decoded(so),
+               let n = resolve(sd["N"] ?? .null).intValue, let first = resolve(sd["First"] ?? .null).intValue {
+                var hl = PDFLexer(data)
+                var pairs: [(Int, Int)] = []
+                for _ in 0..<n { guard let a = hl.readToken(), let b = hl.readToken(), let on = Int(a), let oo = Int(b) else { break }; pairs.append((on, oo)) }
+                for (on, oo) in pairs {
+                    var ol = PDFLexer(data, at: first + oo)
+                    if let o = (try? ol.parseObject()) ?? nil { table[on] = o }
+                }
+            }
+            objStmCache[sn] = table
+        }
+        return objStmCache[sn]?[num]
+    }
+
     func object(_ num: Int) -> PDFObj? {
         if let c = cache[num] { return c }
+        if inStream[num] != nil { let o = objectFromStream(num); if let o { cache[num] = o }; return o }
         guard let off = offsets[num], off < bytes.count else { return nil }
         var lx = PDFLexer(bytes, at: off)
         guard let n = lx.readToken(), Int(n) == num, let _ = lx.readToken(), let o = lx.readToken(), o == "obj" else { return nil }
@@ -412,7 +566,15 @@ final class PDFFile {
                     data = PDFFilters.unpredict(data, predictor: pred, colors: resolve(p["Colors"] ?? .int(1)).intValue ?? 1,
                                                bpc: resolve(p["BitsPerComponent"] ?? .int(8)).intValue ?? 8, columns: resolve(p["Columns"] ?? .int(1)).intValue ?? 1)
                 }
-            default: return nil      // andere Filter: nicht unterstützt
+            case "ASCII85Decode", "A85":
+                guard let d = PDFFilters.ascii85(data) else { return nil }
+                data = d
+            case "ASCIIHexDecode", "AHx":
+                var out: [UInt8] = []; var nib: [UInt8] = []
+                for c in data { if c == 0x3E { break }; guard let v = UInt8(String(UnicodeScalar(c)), radix: 16) else { continue }; nib.append(v); if nib.count == 2 { out.append(nib[0] << 4 | nib[1]); nib = [] } }
+                if nib.count == 1 { out.append(nib[0] << 4) }
+                data = out
+            default: return nil      // andere Filter (LZW, DCT, CCITT, JBIG2, JPX): nicht unterstützt
             }
         }
         return data
@@ -648,6 +810,8 @@ final class ContentStream {
     /// Am Ende des Stroms noch offene q-Zustände bzw. ein offener Textblock – wer etwas anhängt, muss sie erst schließen
     private(set) var openStates = 0
     private(set) var endsInText = false
+    /// CTM nach dem Schließen aller offenen q-Zustände – Skia setzt eine Matrix außerhalb jeder Klammer
+    private(set) var endCTM = CGAffineTransform.identity
 
     static let paintOps: Set<String> = ["S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n"]
     static let pathOps: Set<String> = ["m", "l", "c", "v", "y", "h", "re"]
@@ -765,6 +929,7 @@ final class ContentStream {
         if pendingTextElem != nil { finishPendingText(nextOp: "ET") }
         openStates = ctmStack.count
         endsInText = inText
+        endCTM = ctmStack.first ?? ctm
     }
 
     private func num(_ r: Range<Int>, _ k: Int) -> Double {

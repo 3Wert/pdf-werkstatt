@@ -56,6 +56,7 @@ enum SelfTest {
             { note("nach 1. Widerrufen: „\(doc.undoManager?.undoMenuItemTitle ?? "")“ Abdeckung: \(c.coverMarks(redact: false).count), '1.234,56': \(found("1.234,56"))")
               doc.undoManager?.undo() },
             { c.overlay.display(); shot(wc, dir + "/schwaerzen-3-widerrufen.png")
+              note("Anmerkungen nach Widerrufen: " + page().annotations.map { ($0 as? WObject).map { "W:\($0.model.kind.rawValue)/\($0.model.redact ?? false)" } ?? ($0.type ?? "?") }.joined(separator: ", ") + " · Bytes des Stands: \(doc.currentData()?.count ?? -1)")
               note("nach 2× Widerrufen: Schwärzungen \(c.coverMarks(redact: true).count) (3 erwartet), 'Mustermann' auffindbar: \(found("Mustermann")) (true erwartet), '1.234,56': \(found("1.234,56")) (true erwartet)") },
             { let ok = wc.applyRedactions(confirm: false); note("erneut anwenden: \(ok ? "ok" : "FEHLER")") },
             { closeSheet()

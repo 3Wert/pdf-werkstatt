@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.w("--- Start \(Bundle.main.infoDictionary?["CFBundleVersion"] ?? "") ---")
         UndoStore.purge()
         RedactTest.runIfRequested()
+        SaveTest.runIfRequested()
         Updater.start()
         SelfTest.runIfRequested()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {

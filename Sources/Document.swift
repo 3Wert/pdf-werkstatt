@@ -77,10 +77,12 @@ final class WDocument: NSDocument {
         }
         hydrate(document: d)
         pdf = d
+        if password == nil { setOrigin(data) }
     }
 
     override func data(ofType typeName: String) throws -> Data {
         controller?.canvas.endEditing()
+        if password == nil || password?.isEmpty == true, let d = currentData() { return d }
         guard let data = DrawMode.full({ pdf.dataRepresentation(options: PDFTools.writeOptions(password: password)) }) else {
             throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError)
         }
@@ -209,13 +211,62 @@ final class WDocument: NSDocument {
         return out
     }
 
-    /// Aktueller Stand als Bytes (inkl. aller eigenen Objekte) – Grundlage für Eingriffe in den Seiteninhalt
+    // MARK: Herkunft des Seiteninhalts
+    //
+    // PDFKit rendert beim Schreiben jede Seite neu – Type3-Schriften (Chrome/Skia-Ausdrucke) werden dabei zu Pfaden,
+    // der Text ist danach weder durchsuch- noch kopierbar. Deshalb merkt sich das Dokument je Seite, aus welchen Bytes
+    // ihr Inhalt stammt, und setzt nach dem PDFKit-Schreiben den originalen Inhaltsstrom samt Ressourcen wieder ein.
+
+    /// Bytes, aus denen Seiten stammen (Originaldatei, Ergebnisse von Inhalts-Eingriffen)
+    final class Origin { let data: Data; lazy var file: PDFFile? = try? PDFFile(data: data); init(_ d: Data) { data = d } }
+    private var pageOrigin: [ObjectIdentifier: (Origin, Int)] = [:]
+
+    /// Alle Seiten der aktuellen PDFDocument-Instanz auf `origin` (gleiche Reihenfolge) zurückführen
+    func setOrigin(_ data: Data) {
+        let o = Origin(data)
+        pageOrigin = [:]
+        for i in 0..<pdf.pageCount { if let p = pdf.page(at: i) { pageOrigin[ObjectIdentifier(p)] = (o, i) } }
+    }
+    func origin(of page: PDFPage) -> (Data, Int)? { pageOrigin[ObjectIdentifier(page)].map { ($0.0.data, $0.1) } }
+
+    /// PDFKit-Ausgabe, bei der unveränderte Seiten ihren ursprünglichen Inhalt zurückbekommen
+    private func withOriginalContent(_ pdfkitData: Data) -> Data {
+        guard !pageOrigin.isEmpty, let f = try? PDFFile(data: pdfkitData) else { return pdfkitData }
+        let pages = f.pageObjects()
+        var dicts: [Int: [String: PDFObj]] = [:]
+        var newObjs: [(Int, PDFObj)] = []
+        var next = f.firstFreeObject
+        var count = 0
+        for i in 0..<min(pages.count, pdf.pageCount) {
+            guard let p = pdf.page(at: i), let (o, j) = pageOrigin[ObjectIdentifier(p)], let src = o.file else { continue }
+            let srcPages = src.pageObjects()
+            guard j < srcPages.count, var pd = f.pageDict(pages[i]), let sd = src.pageDict(srcPages[j]),
+                  let mbA = f.mediaBox(ofPage: pages[i]), let mbB = src.mediaBox(ofPage: srcPages[j]),
+                  abs(mbA.minX - mbB.minX) < 0.05, abs(mbA.minY - mbB.minY) < 0.05, abs(mbA.width - mbB.width) < 0.05, abs(mbA.height - mbB.height) < 0.05,
+                  let contents = sd["Contents"] else { continue }
+            let res = PDFObj.dict(src.pageResources(srcPages[j]))
+            let (newRoot, objs) = f.imported(.array([contents, res]), from: src, firstFree: next)
+            guard case .array(let pair) = newRoot, pair.count == 2 else { continue }
+            newObjs += objs
+            next += objs.count
+            pd["Contents"] = pair[0]
+            pd["Resources"] = pair[1]
+            dicts[pages[i]] = pd
+            count += 1
+        }
+        guard count > 0, let inc = f.updated(pageDicts: dicts, newObjects: newObjs), let f2 = try? PDFFile(data: inc), let out = f2.compacted() else { return pdfkitData }
+        Log.v("Seiteninhalt aus Original übernommen: \(count) Seiten, \(out.count) Bytes")
+        return out
+    }
+
+    /// Aktueller Stand als Bytes (inkl. aller eigenen Objekte) – Grundlage für Eingriffe in den Seiteninhalt und fürs Sichern
     func currentData() -> Data? {
         controller?.canvas.endEditing()
         if let (g, d) = cachedData, g == generation { return d }
         guard let d = DrawMode.full({ pdf.dataRepresentation() }) else { return nil }
-        cachedData = (generation, d)
-        return d
+        let out = withOriginalContent(d)
+        cachedData = (generation, out)
+        return out
     }
 
     /// Dokument durch neue Bytes ersetzen (nach direktem Eingriff in den Inhalt). Widerrufbar über die alten Bytes.
@@ -224,6 +275,7 @@ final class WDocument: NSDocument {
         hydrate(document: d)
         let idx = controller?.canvas.currentPage.map { pdf.index(for: $0) } ?? 0
         pdf = d
+        setOrigin(new)
         controller?.documentReplaced(pageIndex: idx)
         // Alter Stand auf die Platte statt in den Speicher (bei 20 MB und zehn Schritten sonst 200 MB)
         if let oldURL = UndoStore.save(old) {
@@ -245,6 +297,7 @@ final class WDocument: NSDocument {
         hydrate(document: d)
         let idx = controller?.canvas.currentPage.map { pdf.index(for: $0) } ?? 0
         pdf = d
+        setOrigin(data)
         controller?.documentReplaced(pageIndex: idx)
     }
 
