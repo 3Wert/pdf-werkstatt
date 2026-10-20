@@ -291,7 +291,7 @@ enum OCRTest {
                 let mark = RedactMark(pageIndex: rep.pages.first ?? 0, rect: sel.bounds(for: p).insetBy(dx: -0.5, dy: -0.5), color: RGBA(.black))
                 let red = Redactor(marks: [mark])
                 if let r2 = red.apply(to: out, paintBoxes: true), let d2 = PDFDocument(data: r2) {
-                    let still = !(d2.page(at: mark.pageIndex)?.selection(for: mark.rect.insetBy(dx: 1, dy: 1))?.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                    let still = !(d2.page(at: mark.pageIndex)?.selection(for: mark.rect.redactCore)?.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
                     redactNote = " · Schwärzen „\(word)“: \(red.report.summary)\(still ? " ⚠️ noch auffindbar" : ", weg")"
                     if still { problems.append("Schwärzen nach OCR unvollständig") }
                     try? r2.write(to: URL(fileURLWithPath: dir).appendingPathComponent("Ergebnisse").appendingPathComponent((name as NSString).deletingPathExtension + ".ocr.geschwaerzt.pdf"))

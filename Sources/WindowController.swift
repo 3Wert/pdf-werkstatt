@@ -442,9 +442,14 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
             a.alertStyle = .warning
             a.messageText = marks.count == 1 ? "Eine Schwärzung anwenden?" : "\(marks.count) Schwärzungen anwenden?"
             a.informativeText = "Der Inhalt darunter wird endgültig aus der Datei entfernt: Text zeichenweise, Bilder pixelweise, Anmerkungen im Bereich. Die Datei wird ohne Altstände neu geschrieben. Widerrufen geht, solange das Dokument geöffnet ist."
+            let meta = NSButton(checkboxWithTitle: "Metadaten entfernen (Titel, Autor, Programm, Zeiten, XMP)", target: nil, action: nil)
+            meta.state = (prefs.object(forKey: "schwaerzenMetadaten") as? Bool ?? true) ? .on : .off
+            meta.frame = NSRect(x: 0, y: 0, width: 420, height: 20)
+            a.accessoryView = meta
             a.addButton(withTitle: "Anwenden")
             a.addButton(withTitle: "Abbrechen")
             guard a.runModal() == .alertFirstButtonReturn else { return false }
+            prefs.set(meta.state == .on, forKey: "schwaerzenMetadaten")
         }
         let t0 = Date()
         guard let rep = canvas.applyRedaction(marks, paint: true, removeAnnots: true, action: "Schwärzungen anwenden") else {

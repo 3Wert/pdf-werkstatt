@@ -275,6 +275,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
         d.touch()
         guard let fresh = d.currentData() else { d.restore(old); return nil }
         var red = Redactor(marks: marks)
+        red.stripMetadata = paint && prefs.object(forKey: "schwaerzenMetadaten") as? Bool ?? true
         guard var out = red.apply(to: fresh, paintBoxes: paint) else {
             Log.w("Schwärzen fehlgeschlagen: \(red.report.notes.joined(separator: "; "))")
             d.restore(old); return nil
@@ -284,7 +285,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             guard let check = PDFDocument(data: data) else { return ["Ergebnis nicht lesbar"] }
             var out: [String] = []
             for m in marks {
-                if let p = check.page(at: m.pageIndex), let s = p.selection(for: m.rect.insetBy(dx: 1, dy: 1))?.string?.trimmed, !s.isEmpty {
+                if let p = check.page(at: m.pageIndex), let s = p.selection(for: m.rect.redactCore)?.string?.trimmed, !s.isEmpty {
                     out.append("Seite \(m.pageIndex + 1): „\(s.prefix(40))“")
                 }
             }
@@ -295,6 +296,7 @@ final class Canvas: PDFView, NSTextViewDelegate {
             // Letzte Stufe: betroffene Seiten als Bild
             Log.w("Schwärzen: Text noch auffindbar (\(found.joined(separator: "; "))) – Seiten werden als Bild geschrieben")
             red = Redactor(marks: marks, forceRaster: true)
+            red.stripMetadata = paint && prefs.object(forKey: "schwaerzenMetadaten") as? Bool ?? true
             if let out2 = red.apply(to: fresh, paintBoxes: paint) {
                 out = out2; report = red.report
                 found = leaks(out)

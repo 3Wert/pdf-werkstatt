@@ -68,6 +68,7 @@ final class WDocument: NSDocument {
         if d.isLocked {
             var ok = false
             let name = fileURL?.lastPathComponent ?? "Dokument"
+            if let envPw = ProcessInfo.processInfo.environment["PDFW_PW"], d.unlock(withPassword: envPw) { ok = true; password = envPw }
             while !ok {
                 guard let pw = Dialogs.askPassword(file: name) else {
                     throw NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError)
@@ -78,7 +79,7 @@ final class WDocument: NSDocument {
         }
         hydrate(document: d)
         pdf = d
-        if password == nil { setOrigin(data) }
+        setOrigin(data)
         scanCandidate = password == nil && OCR.looksScanned(data, pdf: d)
     }
     /// Beim Öffnen erkannt: Scan ohne Textebene → der Fenster-Controller bietet Texterkennung an
@@ -86,7 +87,11 @@ final class WDocument: NSDocument {
 
     override func data(ofType typeName: String) throws -> Data {
         controller?.canvas.endEditing()
-        if password == nil || password?.isEmpty == true, let d = currentData() { return d }
+        if let d = currentData() {
+            guard let pw = password, !pw.isEmpty else { return d }
+            // Mit Passwort: selbst verschlüsseln (AES-256) – PDFKit würde dafür alle Seiten neu rendern
+            if let f = try? PDFFile(data: d), let enc = f.compacted(encrypt: PDFCrypt.Writer(password: pw)) { return enc }
+        }
         guard let data = DrawMode.full({ pdf.dataRepresentation(options: PDFTools.writeOptions(password: password)) }) else {
             throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError)
         }
@@ -222,12 +227,16 @@ final class WDocument: NSDocument {
     // ihr Inhalt stammt, und setzt nach dem PDFKit-Schreiben den originalen Inhaltsstrom samt Ressourcen wieder ein.
 
     /// Bytes, aus denen Seiten stammen (Originaldatei, Ergebnisse von Inhalts-Eingriffen)
-    final class Origin { let data: Data; lazy var file: PDFFile? = try? PDFFile(data: data); init(_ d: Data) { data = d } }
+    final class Origin {
+        let data: Data; let password: String?
+        lazy var file: PDFFile? = try? PDFFile(data: data, password: password)
+        init(_ d: Data, password: String?) { data = d; self.password = password }
+    }
     private var pageOrigin: [ObjectIdentifier: (Origin, Int)] = [:]
 
     /// Alle Seiten der aktuellen PDFDocument-Instanz auf `origin` (gleiche Reihenfolge) zurückführen
     func setOrigin(_ data: Data) {
-        let o = Origin(data)
+        let o = Origin(data, password: password)
         pageOrigin = [:]
         for i in 0..<pdf.pageCount { if let p = pdf.page(at: i) { pageOrigin[ObjectIdentifier(p)] = (o, i) } }
     }
@@ -235,19 +244,23 @@ final class WDocument: NSDocument {
 
     /// PDFKit-Ausgabe, bei der unveränderte Seiten ihren ursprünglichen Inhalt zurückbekommen
     private func withOriginalContent(_ pdfkitData: Data) -> Data {
-        guard !pageOrigin.isEmpty, let f = try? PDFFile(data: pdfkitData) else { return pdfkitData }
+        let dbg = ProcessInfo.processInfo.environment["PDFW_ORIGIN_DEBUG"] != nil
+        if dbg { Swift.print("Origin-Debug: withOriginalContent, Herkünfte: \(pageOrigin.count), Passwort: \(password != nil)") }
+        guard !pageOrigin.isEmpty else { if dbg { Swift.print("Origin-Debug: keine Herkunft") }; return pdfkitData }
+        guard let f = try? PDFFile(data: pdfkitData, password: password) else { if dbg { Swift.print("Origin-Debug: PDFKit-Ausgabe nicht lesbar (verschlüsselt: \((try? PDFFile(data: pdfkitData, password: password))?.isEncrypted ?? false))") }; return pdfkitData }
         let pages = f.pageObjects()
         var dicts: [Int: [String: PDFObj]] = [:]
         var newObjs: [(Int, PDFObj)] = []
         var next = f.firstFreeObject
         var count = 0
         for i in 0..<min(pages.count, pdf.pageCount) {
-            guard let p = pdf.page(at: i), let (o, j) = pageOrigin[ObjectIdentifier(p)], let src = o.file else { continue }
+            guard let p = pdf.page(at: i), let (o, j) = pageOrigin[ObjectIdentifier(p)] else { if dbg { Swift.print("Origin-Debug: Seite \(i) ohne Herkunft") }; continue }
+            guard let src = o.file else { if dbg { Swift.print("Origin-Debug: Herkunftsdatei nicht lesbar: \(String(describing: try? PDFFile(data: o.data, password: o.password)))") }; continue }
             let srcPages = src.pageObjects()
             guard j < srcPages.count, var pd = f.pageDict(pages[i]), let sd = src.pageDict(srcPages[j]),
                   let mbA = f.mediaBox(ofPage: pages[i]), let mbB = src.mediaBox(ofPage: srcPages[j]),
                   abs(mbA.minX - mbB.minX) < 0.05, abs(mbA.minY - mbB.minY) < 0.05, abs(mbA.width - mbB.width) < 0.05, abs(mbA.height - mbB.height) < 0.05,
-                  let contents = sd["Contents"] else { continue }
+                  let contents = sd["Contents"] else { if dbg { Swift.print("Origin-Debug: Seite \(i): Box/Inhalt passt nicht – \(String(describing: f.mediaBox(ofPage: pages[i]))) vs \(String(describing: src.mediaBox(ofPage: srcPages[j])))") }; continue }
             let res = PDFObj.dict(src.pageResources(srcPages[j]))
             let (newRoot, objs) = f.imported(.array([contents, res]), from: src, firstFree: next)
             guard case .array(let pair) = newRoot, pair.count == 2 else { continue }
@@ -258,7 +271,10 @@ final class WDocument: NSDocument {
             dicts[pages[i]] = pd
             count += 1
         }
-        guard count > 0, let inc = f.updated(pageDicts: dicts, newObjects: newObjs), let f2 = try? PDFFile(data: inc), let out = f2.compacted() else { return pdfkitData }
+        if dbg { Swift.print("Origin-Debug: \(count) Seiten übernommen, \(newObjs.count) Objekte") }
+        guard count > 0, let inc = f.updated(pageDicts: dicts, newObjects: newObjs) else { if dbg { Swift.print("Origin-Debug: updated fehlgeschlagen") }; return pdfkitData }
+        guard let f2 = try? PDFFile(data: inc) else { if dbg { Swift.print("Origin-Debug: Zwischenstand nicht lesbar: \(String(describing: (try? PDFFile(data: inc)) == nil ? (Result { try PDFFile(data: inc) }) : nil))") }; return pdfkitData }
+        guard let out = f2.compacted() else { if dbg { Swift.print("Origin-Debug: compacted fehlgeschlagen") }; return pdfkitData }
         Log.v("Seiteninhalt aus Original übernommen: \(count) Seiten, \(out.count) Bytes")
         return out
     }
@@ -267,7 +283,12 @@ final class WDocument: NSDocument {
     func currentData() -> Data? {
         controller?.canvas.endEditing()
         if let (g, d) = cachedData, g == generation { return d }
-        guard let d = DrawMode.full({ pdf.dataRepresentation() }) else { return nil }
+        guard var d = DrawMode.full({ pdf.dataRepresentation() }) else { return nil }
+        if ProcessInfo.processInfo.environment["PDFW_ORIGIN_DEBUG"] != nil {
+            let f = try? PDFFile(data: d, password: password)
+            Swift.print("Origin-Debug: currentData – PDFKit-Ausgabe \(d.count) B, lesbar: \(f != nil), verschlüsselt: \(f?.isEncrypted ?? false)")
+        }
+        if let pw = password, !pw.isEmpty, let f = try? PDFFile(data: d, password: pw), f.isEncrypted, let plain = f.compacted() { d = plain }
         let out = withOriginalContent(d)
         cachedData = (generation, out)
         return out

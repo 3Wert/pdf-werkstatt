@@ -1,5 +1,10 @@
 # Änderungen
 
+## 1.6 – 20.10.2026
+- Passwortgeschützte PDFs: Lesen (RC4, AES-128, AES-256) und Schreiben (AES-256) jetzt im eigenen Leser/Schreiber – beim Sichern bleibt der Originalinhalt erhalten, auch bei Browser-Ausdrucken; PDFKit hatte verschlüsselte Dateien bisher komplett neu gerendert
+- Schwärzungen anwenden: Haken „Metadaten entfernen“ (Titel, Autor, Programm, Zeiten, XMP) – standardmäßig an, wird gemerkt
+- Schwärzen: Entfernregel und Sicherheitsprüfung beziehen sich auf denselben Kern (Markierung minus 2,5 pt Rand); Zeichen, die überwiegend unter der Markierung liegen, werden auch dann entfernt, wenn sie nur den Rand berühren. Angeschnittene Zeilen führen nicht mehr unnötig zur Bildseite
+
 ## 1.5 – 20.10.2026
 - Texterkennung (OCR): Werkzeuge › Text erkennen (OCR) … (⌥⌘T) erkennt Text auf gescannten Seiten mit Apple Vision (Deutsch/Englisch, ohne Internet) und legt ihn unsichtbar wortgenau über das Bild – danach durchsuchbar, kopierbar und für „Suchen und schwärzen“ erreichbar; die Darstellung bleibt pixelgleich
 - Beim Öffnen eines Scans ohne Textebene wird die Erkennung angeboten

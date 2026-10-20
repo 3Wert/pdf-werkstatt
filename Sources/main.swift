@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RedactTest.runIfRequested()
         SaveTest.runIfRequested()
         OCRTest.runIfRequested()
+        CryptTest.runIfRequested()
         Updater.start()
         SelfTest.runIfRequested()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {

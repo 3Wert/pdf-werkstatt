@@ -13,6 +13,12 @@ struct RedactMark {
     var color: RGBA
 }
 
+extension CGRect {
+    /// Kern einer Markierung: 2,5 pt Rand abgezogen (bei kleinen Markierungen anteilig). Zeichen, die in den Kern ragen,
+    /// werden entfernt; die Prüfung danach schaut nur in den Kern. Der Rand bleibt von der schwarzen Fläche gedeckt.
+    var redactCore: CGRect { insetBy(dx: min(2.5, width / 4), dy: min(2.5, height / 4)) }
+}
+
 struct RedactReport {
     var glyphs = 0              // einzeln entfernte Zeichen
     var textElements = 0        // ganz entfernte Textstücke
@@ -274,6 +280,8 @@ enum RedactRaster {
 final class Redactor {
     let marks: [RedactMark]
     let forceRaster: Bool
+    /// Beim Neuschreiben /Info, XMP und PieceInfo weglassen (Titel, Autor, Programm, Zeiten)
+    var stripMetadata = false
     private(set) var report = RedactReport()
     private var nextObj = 0
     private var newObjects: [(Int, PDFObj)] = []
@@ -333,11 +341,14 @@ final class Redactor {
                 return rects.map { r -> CGFloat in let i = b.intersection(r); return i.isNull ? 0 : (i.width * i.height) / max(b.width * b.height, 0.01) }.max() ?? 0
             }
 
+            let debug = ProcessInfo.processInfo.environment["PDFW_REDACT_DEBUG"] != nil
+            if debug { print("Redact-Debug S\(pageIndex + 1): \(model.elements.count) Elemente, \(model.stream.tokens.count) Token, vermessen: \(model.elements.filter { $0.bounds.isUsable }.count), Hinweis: \(model.note ?? "–"), Markierungen: \(rects.map { $0.integral })") }
             for k in model.elements.indices where !needRaster {
                 var e = model.elements[k]
                 if let b = boundsOf[k] { e.bounds = b }
                 let cov = coverage(k)
                 guard cov > 0.001, e.bounds.isUsable else { continue }
+                if debug { print("Redact-Debug S\(pageIndex + 1) Element \(k) \(e.kind) „\(e.name.prefix(30))“ Deckung \(Int(cov * 100))% Box \(e.bounds.integral) inText=\(e.inText) canRemove=\(e.canRemove)") }
                 switch e.kind {
                 case .text:
                     switch redactText(k, model: model, file: file, pageObj: pageObj, rects: rects, resources: resources) {
@@ -429,9 +440,10 @@ final class Redactor {
             updates[pp.pageObj] = (content, pp.extra)
         }
         report.pagesRasterized.sort()
-        guard let inc = file.updated(pages: updates, newObjects: newObjects), let f2 = try? PDFFile(data: inc), let out = f2.compacted() else {
+        guard let inc = file.updated(pages: updates, newObjects: newObjects), let f2 = try? PDFFile(data: inc), let out = f2.compacted(stripMetadata: stripMetadata) else {
             report.notes.append("Datei konnte nicht neu geschrieben werden"); return nil
         }
+        if stripMetadata { report.notes.append("Metadaten entfernt (Titel, Autor, Programm, Zeiten, XMP)") }
         return out
     }
 
@@ -472,7 +484,7 @@ final class Redactor {
             ctx.drawPDFPage(pg)
             var bad = 0
             for m in pp.marks {
-                let r = m.rect.insetBy(dx: 1.2, dy: 1.2)
+                let r = m.rect.redactCore
                 guard r.width > 0, r.height > 0 else { continue }
                 let x0 = max(0, Int(((r.minX - box.minX) * scale).rounded(.up))), x1 = min(w - 1, Int(((r.maxX - box.minX) * scale).rounded(.down)))
                 let y0 = max(0, Int(((box.maxY - r.maxY) * scale).rounded(.up))), y1 = min(h - 1, Int(((box.maxY - r.minY) * scale).rounded(.down)))
@@ -592,10 +604,12 @@ final class Redactor {
         var removedBoxes: [CGRect] = []
         for g in glyphs.indices {
             guard let b = boxes[g + 1], b.width > 0, b.height > 0 else { continue }
+            // entfernen, wenn das Zeichen in den Kern ragt – oder überwiegend (≥ 50 %) unter der Markierung liegt (schmale Randzeichen wie „l“)
             let hit = rects.contains { r in
+                let c = b.intersection(r.redactCore)
+                if !c.isNull, c.width > 0.05, c.height > 0.05 { return true }
                 let i = b.intersection(r)
-                if i.isNull { return false }
-                return i.width * i.height >= 0.2 * b.width * b.height || r.contains(CGPoint(x: b.midX, y: b.midY))
+                return !i.isNull && i.width * i.height >= 0.5 * b.width * b.height
             }
             if hit { removed.insert(g); removedBoxes.append(b) }
         }
@@ -854,7 +868,7 @@ enum RedactTest {
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             var leaks: [String] = []
             for m in marks {
-                if let p = outDoc.page(at: m.pageIndex), let s = p.selection(for: m.rect.insetBy(dx: 1, dy: 1))?.string?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { leaks.append("S\(m.pageIndex + 1): „\(s)“") }
+                if let p = outDoc.page(at: m.pageIndex), let s = p.selection(for: m.rect.redactCore)?.string?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { leaks.append("S\(m.pageIndex + 1): „\(s)“") }
             }
             for t in (real ? Array(Set(secrets)) : ["DE89", "0532 0130", "Mustermann", "geheim123"]) where !outDoc.findString(t, withOptions: [.caseInsensitive]).isEmpty {
                 // Gleicher Text kann auf Seiten > 3 legitim stehen bleiben

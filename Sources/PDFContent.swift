@@ -363,7 +363,13 @@ final class PDFFile {
     private(set) var maxObj = 0
     private var cache: [Int: PDFObj] = [:]
 
-    init(data: Data) throws {
+    private var crypt: PDFCrypt.Handler?
+    private var encryptObj = -1
+    var isEncrypted: Bool { crypt != nil }
+
+    convenience init(data: Data) throws { try self.init(data: data, password: nil) }
+
+    init(data: Data, password: String?) throws {
         bytes = [UInt8](data)
         guard let sx = PDFLexer.findLast(bytes, Array("startxref".utf8)) else { throw PDFContentError.parse("startxref") }
         var lx = PDFLexer(bytes, at: sx + 9)
@@ -375,8 +381,18 @@ final class PDFFile {
             seen.insert(o)
             next = try parseXref(at: o)
         }
-        if trailer["Encrypt"] != nil { throw PDFContentError.unsupported("verschlüsselt") }
         maxObj = max(maxObj, (trailer["Size"]?.intValue ?? 1) - 1)
+        if let e = trailer["Encrypt"] {
+            if case .ref(let n, _) = e { encryptObj = n }
+            guard let ed = resolve(e).dictValue else { throw PDFContentError.unsupported("Verschlüsselung unlesbar") }
+            var id0: [UInt8] = []
+            if let ids = resolve(trailer["ID"] ?? .null).arrayValue, let f = ids.first, case .string(let s) = resolve(f) { id0 = s }
+            guard let h = PDFCrypt.Handler(encrypt: ed, resolve: { [weak self] o in self?.resolve(o) ?? .null }, id0: id0, password: password ?? "") else {
+                throw PDFContentError.unsupported("verschlüsselt – Passwort passt nicht")
+            }
+            crypt = h
+            cache.removeAll()
+        }
     }
 
     // MARK: Objekte aus einer anderen Datei übernehmen
@@ -531,8 +547,9 @@ final class PDFFile {
         if inStream[num] != nil { let o = objectFromStream(num); if let o { cache[num] = o }; return o }
         guard let off = offsets[num], off < bytes.count else { return nil }
         var lx = PDFLexer(bytes, at: off)
-        guard let n = lx.readToken(), Int(n) == num, let _ = lx.readToken(), let o = lx.readToken(), o == "obj" else { return nil }
-        let obj = try? lx.parseObject(resolveLength: { [weak self] l in self?.resolve(l).intValue })
+        guard let n = lx.readToken(), Int(n) == num, let g = lx.readToken(), let o = lx.readToken(), o == "obj" else { return nil }
+        var obj = try? lx.parseObject(resolveLength: { [weak self] l in self?.resolve(l).intValue })
+        if let c = crypt, let ob = obj, num != encryptObj { obj = c.decrypt(ob, num: num, gen: Int(g) ?? 0) }
         if let obj { cache[num] = obj }
         return obj
     }
@@ -738,17 +755,35 @@ final class PDFFile {
 
     /// Datei neu schreiben: nur noch erreichbare Objekte in ihrer aktuellen Fassung, eine xref-Tabelle, keine Altstände.
     /// Damit verschwinden frühere Inhaltsströme (z. B. vor einer Schwärzung) wirklich aus der Datei.
-    func compacted() -> Data? {
+    /// `stripMetadata`: ohne /Info, ohne XMP (/Metadata) und /PieceInfo im Katalog. `encrypt`: alle Strings und Streams mit AES-256 (R6).
+    func compacted(stripMetadata: Bool = false, encrypt: PDFCrypt.Writer? = nil) -> Data? {
         var roots: [String: PDFObj] = [:]
-        for k in ["Root", "Info"] { if let v = trailer[k] { roots[k] = v } }
-        guard roots["Root"] != nil else { return nil }
-        let objs = closure(of: .dict(roots), followParent: true).sorted()
+        for k in (stripMetadata ? ["Root"] : ["Root", "Info"]) { if let v = trailer[k] { roots[k] = v } }
+        guard case .ref(let rootNum, _)? = roots["Root"] else { return nil }
+        var overrides: [Int: PDFObj] = [:]
+        if stripMetadata, var cat = object(rootNum)?.dictValue {
+            cat["Metadata"] = nil; cat["PieceInfo"] = nil
+            overrides[rootNum] = .dict(cat)
+        }
+        let objs = closure(of: .dict(roots), followParent: true).filter { n in
+            // bei entferntem XMP/PieceInfo deren Objekte nicht mitnehmen
+            guard stripMetadata, let cat = object(rootNum)?.dictValue else { return true }
+            for k in ["Metadata", "PieceInfo"] { if case .ref(let m, _)? = cat[k], m == n { return false } }
+            return true
+        }.sorted()
         var out = Array("%PDF-1.7\n%\u{00E2}\u{00E3}\u{00CF}\u{00D3}\n".utf8)
         var offs: [Int: Int] = [:]
         for n in objs {
-            guard let o = object(n) else { continue }
+            guard var o = overrides[n] ?? object(n) else { continue }
+            if let w = encrypt { o = w.encrypt(o) }
             offs[n] = out.count
             out += Array("\(n) 0 obj\n".utf8); out += PDFWriter.serialize(o); out += Array("\nendobj\n".utf8)
+        }
+        if let w = encrypt {
+            let n = (offs.keys.max() ?? 0) + 1
+            offs[n] = out.count
+            out += Array("\(n) 0 obj\n".utf8); out += PDFWriter.serialize(w.encryptDict); out += Array("\nendobj\n".utf8)
+            roots["Encrypt"] = .ref(n, 0)
         }
         let size = (offs.keys.max() ?? 0) + 1
         let xref = out.count
@@ -759,7 +794,8 @@ final class PDFFile {
         }
         var tr = roots
         tr["Size"] = .int(size)
-        if let id = trailer["ID"] { tr["ID"] = id }
+        if let w = encrypt { tr["ID"] = .array([.string(w.id), .string(w.id)]) }
+        else if let id = trailer["ID"] { tr["ID"] = id }
         out += Array("trailer\n".utf8); out += PDFWriter.serialize(.dict(tr))
         out += Array("\nstartxref\n\(xref)\n%%EOF\n".utf8)
         return Data(out)
