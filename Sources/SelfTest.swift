@@ -14,6 +14,10 @@ extension Canvas {
 /// Selbsttest: PDFW_SELFTEST=<Ordner> – bearbeitet das erste Dokument per Skript, macht Fensterbilder und speichert.
 enum SelfTest {
     static func runIfRequested() {
+        if let dir = ProcessInfo.processInfo.environment["PDFW_EDIT_UITEST"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { editUI(dir) }
+            return
+        }
         if let dir = ProcessInfo.processInfo.environment["PDFW_COMPLEX_UITEST"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { complexUI(dir) }
             return
@@ -28,6 +32,34 @@ enum SelfTest {
         }
         guard let dir = ProcessInfo.processInfo.environment["PDFW_SELFTEST"] else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { step(dir) }
+    }
+
+    /// PDFW_EDIT_UITEST=<Ordner> datei.pdf – Inhalts-Editor mit gerechneten Textkästen: Klick trifft die Zeile, Verschieben landet exakt
+    static func editUI(_ dir: String) {
+        guard let doc = NSDocumentController.shared.documents.first as? WDocument, let wc = doc.controller, let w = wc.window else { return }
+        NSApp.activate(ignoringOtherApps: true); w.makeKeyAndOrderFront(nil)
+        let c = wc.canvas
+        func page() -> PDFPage { doc.pdf.page(at: 0)! }
+        func lb(_ t: String) -> CGRect? { doc.pdf.findString(t, withOptions: []).first.map { $0.bounds(for: page()) } }
+        run([
+            { c.tool = .editText
+              guard let r = lb("IBAN DE89") else { note("FEHL: Text nicht gefunden"); return }
+              let hit = c.selectContent(at: CGPoint(x: r.midX, y: r.midY), on: page())
+              let b = c.contentSel?.bounds ?? .null
+              let line = lb("IBAN DE89 3704 0044 0532 0130 00 - BIC COBADEFFXXX") ?? r
+              note("Klick auf IBAN-Zeile: Treffer \(hit) (true erwartet) · Kasten \(b.integral) · PDFKit-Zeile \(line.integral) · Abweichung links \(String(format: "%.1f", b.minX - line.minX)) pt, unten \(String(format: "%.1f", b.minY - line.minY)) pt (jeweils < 2 erwartet)") },
+            { let before = lb("IBAN DE89")!
+              c.moveContentSelection(dx: 30, dy: -15)
+              let after = lb("IBAN DE89") ?? .null
+              note("Inhalt verschoben um (30, −15): tatsächlich (\(String(format: "%.1f", after.minX - before.minX)), \(String(format: "%.1f", after.minY - before.minY))) (30, −15 erwartet)") },
+            { doc.undoManager?.undo()
+              let back = lb("IBAN DE89") ?? .null; let orig = lb("Telefon 0151")!
+              note("nach Widerrufen: IBAN-Zeile x=\(String(format: "%.1f", back.minX)), Telefon-Zeile x=\(String(format: "%.1f", orig.minX)) (gleich erwartet)") },
+            { // Leeres Rechteck trifft nichts; Bereichsauswahl über zwei Zeilen findet genau diese
+              c.tool = .rectSelect
+              c.selectContent(in: CGRect(x: 55, y: 712, width: 400, height: 50), on: page())
+              note("Bereich über 2 Zeilen: \(c.contentSel?.indices.count ?? 0) Elemente (2 erwartet)") },
+        ]) { finish(dir) }
     }
 
     /// PDFW_COMPLEX_UITEST=<Ordner> datei.pdf – Seite aus Zehntausenden Kurven: klare Meldung statt Hängen, Schwärzen mit Fortschritt

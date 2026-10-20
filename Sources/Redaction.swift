@@ -54,6 +54,23 @@ struct FontMetrics {
     var twoByte = false
     var widths: [Int: Double] = [:]      // Code → Breite in 1/1000 Textraum
     var defaultWidth = 0.0
+    var ascent = 900.0, descent = -220.0  // 1/1000 Textraum, für rechnerische Kästen
+
+    /// Ober-/Unterlänge aus FontDescriptor oder FontBBox (Skalierung für Type3)
+    private mutating func readVertical(_ font: [String: PDFObj], _ f: PDFFile, scale: Double) {
+        var a: Double? = nil, d: Double? = nil
+        if let desc = f.resolve(font["FontDescriptor"] ?? .null).dictValue {
+            a = f.resolve(desc["Ascent"] ?? .null).doubleValue; d = f.resolve(desc["Descent"] ?? .null).doubleValue
+            if (a ?? 0) == 0 || (d ?? 0) == 0, let bb = f.resolve(desc["FontBBox"] ?? .null).arrayValue, bb.count == 4 {
+                let v = bb.map { f.resolve($0).doubleValue ?? 0 }; if (a ?? 0) == 0 { a = max(v[1], v[3]) }; if (d ?? 0) == 0 { d = min(v[1], v[3]) }
+            }
+        }
+        if let bb = f.resolve(font["FontBBox"] ?? .null).arrayValue, bb.count == 4, a == nil {
+            let v = bb.map { f.resolve($0).doubleValue ?? 0 }; a = max(v[1], v[3]) * scale; d = min(v[1], v[3]) * scale
+        }
+        if let a, a > 0 { ascent = a }
+        if let d, d < 0 { descent = d }
+    }
     var wordSpaceApplies: Bool { !twoByte }
 
     func width(_ code: Int) -> Double { widths[code] ?? defaultWidth }
@@ -98,6 +115,7 @@ struct FontMetrics {
                   let dfs = f.resolve(font["DescendantFonts"] ?? .null).arrayValue, let d0 = dfs.first,
                   let cid = f.resolve(d0).dictValue else { return nil }
             twoByte = true
+            readVertical(cid, f, scale: 1)
             defaultWidth = f.resolve(cid["DW"] ?? .int(1000)).doubleValue ?? 1000
             if let w = f.resolve(cid["W"] ?? .null).arrayValue {
                 var i = 0
@@ -120,7 +138,8 @@ struct FontMetrics {
         if sub == "Type3" {
             guard let m = f.resolve(font["FontMatrix"] ?? .null).arrayValue, m.count == 6, let a = f.resolve(m[0]).doubleValue else { return nil }
             scale = a * 1000
-        }
+            if let dd = f.resolve(m[3]).doubleValue { ascent = 0; descent = 0; readVertical(font, f, scale: abs(dd) * 1000); if ascent == 0 { ascent = 900 }; if descent == 0 { descent = -220 } }
+        } else { readVertical(font, f, scale: 1) }
         if let desc = f.resolve(font["FontDescriptor"] ?? .null).dictValue, let mw = f.resolve(desc["MissingWidth"] ?? .null).doubleValue { defaultWidth = mw * scale }
         guard let ws = f.resolve(font["Widths"] ?? .null).arrayValue else {
             // Standard-14 ohne Breiten (reportlab, alte Erzeuger): Breiten der metrisch gleichen macOS-Schriften über CoreText
@@ -141,8 +160,10 @@ struct FontMetrics {
 enum RedactRaster {
     /// Rendert Varianten eines Seiteninhalts (gleiche Ressourcen) und liefert deren Bounding-Boxen in Seitenkoordinaten.
     /// `variants[0]` ist die Leer-Referenz.
-    static func bounds(file f: PDFFile, pageObj: Int, mediaBox: CGRect, variants: [[UInt8]], scale: CGFloat) -> [CGRect?] {
-        let w = Int(ceil(mediaBox.width * scale)), h = Int(ceil(mediaBox.height * scale))
+    /// `region`: nur diesen Ausschnitt der Seite rendern (z. B. die Zeile eines Textstücks) – bei Zeichen-Vermessung 20–50× schneller
+    static func bounds(file f: PDFFile, pageObj: Int, mediaBox: CGRect, variants: [[UInt8]], scale: CGFloat, region: CGRect? = nil) -> [CGRect?] {
+        let box = region.map { $0.intersection(mediaBox) }.flatMap { $0.isNull || $0.isEmpty ? nil : $0 } ?? mediaBox
+        let w = Int(ceil(box.width * scale)), h = Int(ceil(box.height * scale))
         guard w > 0, h > 0, w * h < 12_000_000, variants.count >= 2,
               let data = f.standalone(pageObj: pageObj, contents: variants, mediaBox: mediaBox),
               let prov = CGDataProvider(data: data as CFData), let doc = CGPDFDocument(prov),
@@ -152,7 +173,7 @@ enum RedactRaster {
             guard let pg = doc.page(at: i + 1) else { return nil }
             ctx.saveGState()
             ctx.setFillColor(gray: 1, alpha: 1); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
-            ctx.scaleBy(x: scale, y: scale); ctx.translateBy(x: -mediaBox.minX, y: -mediaBox.minY)
+            ctx.scaleBy(x: scale, y: scale); ctx.translateBy(x: -box.minX, y: -box.minY)
             ctx.drawPDFPage(pg)
             ctx.restoreGState()
             return Array(UnsafeBufferPointer(start: buf, count: w * h))
@@ -170,7 +191,7 @@ enum RedactRaster {
                 }
             }
             if maxX >= minX {
-                out.append(CGRect(x: CGFloat(minX) / scale + mediaBox.minX, y: CGFloat(h - 1 - maxY) / scale + mediaBox.minY,
+                out.append(CGRect(x: CGFloat(minX) / scale + box.minX, y: CGFloat(h - 1 - maxY) / scale + box.minY,
                                   width: CGFloat(maxX - minX + 1) / scale, height: CGFloat(maxY - minY + 1) / scale))
             } else { out.append(nil) }
         }
@@ -202,8 +223,9 @@ enum RedactRaster {
     }
 
     /// Vergleich zweier Varianten mit Zonen: (abweichende Pixel außerhalb der Zonen, Tinte von b innerhalb der Zonen, Tinte von a gesamt)
-    static func compare(file f: PDFFile, pageObj: Int, mediaBox: CGRect, a: [UInt8], b: [UInt8], scale: CGFloat, zones: [CGRect]) -> (Int, Int, Int)? {
-        let w = Int(ceil(mediaBox.width * scale)), h = Int(ceil(mediaBox.height * scale))
+    static func compare(file f: PDFFile, pageObj: Int, mediaBox: CGRect, a: [UInt8], b: [UInt8], scale: CGFloat, zones: [CGRect], region: CGRect? = nil) -> (Int, Int, Int)? {
+        let box = region.map { $0.intersection(mediaBox) }.flatMap { $0.isNull || $0.isEmpty ? nil : $0 } ?? mediaBox
+        let w = Int(ceil(box.width * scale)), h = Int(ceil(box.height * scale))
         guard w > 0, h > 0, w * h < 12_000_000,
               let data = f.standalone(pageObj: pageObj, contents: [a, b], mediaBox: mediaBox),
               let prov = CGDataProvider(data: data as CFData), let doc = CGPDFDocument(prov) else { return nil }
@@ -213,14 +235,14 @@ enum RedactRaster {
                   let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue),
                   let buf = ctx.data?.bindMemory(to: UInt8.self, capacity: w * h) else { return nil }
             ctx.setFillColor(gray: 1, alpha: 1); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
-            ctx.scaleBy(x: scale, y: scale); ctx.translateBy(x: -mediaBox.minX, y: -mediaBox.minY)
+            ctx.scaleBy(x: scale, y: scale); ctx.translateBy(x: -box.minX, y: -box.minY)
             ctx.drawPDFPage(pg)
             imgs.append(Array(UnsafeBufferPointer(start: buf, count: w * h)))
         }
         // Zonen in Pixel (etwas großzügig, Antialiasing)
         let zpx = zones.map { z -> (Int, Int, Int, Int) in
             let r = z.insetBy(dx: -1, dy: -1)
-            return (Int((r.minX - mediaBox.minX) * scale), Int((mediaBox.maxY - r.maxY) * scale), Int(((r.maxX - mediaBox.minX) * scale).rounded(.up)), Int(((mediaBox.maxY - r.minY) * scale).rounded(.up)))
+            return (Int((r.minX - box.minX) * scale), Int((box.maxY - r.maxY) * scale), Int(((r.maxX - box.minX) * scale).rounded(.up)), Int(((box.maxY - r.minY) * scale).rounded(.up)))
         }
         var diffOut = 0, inkIn = 0, inkTotal = 0
         for y in 0..<h {
@@ -301,6 +323,7 @@ final class Redactor {
             let pageMarks = marks.filter { $0.pageIndex == pageIndex }
             let rects = pageMarks.map { $0.rect.insetBy(dx: -0.3, dy: -0.3) }
             var pages = file.pageObjects()
+            let tLoad = Date()
             guard pageIndex < pages.count, var model = PageContentModel.load(file: file, pageIndex: pageIndex, reuse: nil) else {
                 report.notes.append("Seite \(pageIndex + 1): Inhalt nicht lesbar"); return nil
             }
@@ -355,6 +378,9 @@ final class Redactor {
             }
 
             let debug = ProcessInfo.processInfo.environment["PDFW_REDACT_DEBUG"] != nil
+            if debug { print("Redact-Debug S\(pageIndex + 1): Modell+Vermessung \(Int(Date().timeIntervalSince(tLoad) * 1000)) ms") }
+            let tElems = Date()
+            defer { if debug { print("Redact-Debug S\(pageIndex + 1): Elemente bearbeitet in \(Int(Date().timeIntervalSince(tElems) * 1000)) ms") } }
             if debug { print("Redact-Debug S\(pageIndex + 1): \(model.elements.count) Elemente, \(model.stream.tokens.count) Token, vermessen: \(model.elements.filter { $0.bounds.isUsable }.count), Hinweis: \(model.note ?? "–"), Markierungen: \(rects.map { $0.integral })") }
             for k in model.elements.indices where !needRaster {
                 var e = model.elements[k]
@@ -418,8 +444,10 @@ final class Redactor {
         // Leere oder die Schwärzungsfarbe (geschwärzte Bildpixel) zu sehen sein. Sonst ist etwas stehen geblieben
         // (z. B. Text als Vektorpfade auf einer zu komplexen Seite) → Seite als Bild.
         for pp in pending where !pp.rastered { updates[pp.pageObj] = (pp.content, pp.extra) }
+        let tRes = Date()
         if let probe = file.updated(pages: updates, newObjects: newObjects) {
             let residue = Redactor.residue(probe, pending: pending)
+            if ProcessInfo.processInfo.environment["PDFW_REDACT_DEBUG"] != nil { print("Redact-Debug: Rest-Prüfung \(Int(Date().timeIntervalSince(tRes) * 1000)) ms") }
             for (k, pp) in pending.enumerated() where !pp.rastered && (residue[pp.pageIndex] ?? 0) > 0 {
                 Log.w("Schwärzen: Seite \(pp.pageIndex + 1) – unter der Markierung ist noch Inhalt zu sehen (\(residue[pp.pageIndex] ?? 0) px), Seite wird als Bild geschrieben")
                 guard let (c, res) = rasterizePage(file: file, pageIndex: pp.pageIndex, mediaBox: pp.mediaBox, rects: pp.marks.map { $0.rect }, color: pp.color) else {
@@ -611,7 +639,8 @@ final class Redactor {
         let scale: CGFloat = 1.5
         var variants = [model.stream.render(model.elements.indices.map { .remove($0) })]
         for g in glyphs.indices { variants.append(model.stream.render([.isolate(k), .replace(k, variant(visible: [g], forceVisible: true))])) }
-        let boxes = RedactRaster.bounds(file: f, pageObj: pageObj, mediaBox: model.mediaBox, variants: variants, scale: scale)
+        let region = e.bounds.isUsable ? e.bounds.insetBy(dx: -e.bounds.height - 4, dy: -e.bounds.height - 4) : nil
+        let boxes = RedactRaster.bounds(file: f, pageObj: pageObj, mediaBox: model.mediaBox, variants: variants, scale: scale, region: region)
         guard boxes.count == glyphs.count + 1 else { return .removeWhole }
         var removed = Set<Int>()
         var removedBoxes: [CGRect] = []
@@ -642,7 +671,9 @@ final class Redactor {
         //    innerhalb muss alles verschwunden sein. (Unabhängig von Schriftart und Textmodus.)
         let original = model.stream.render([.isolate(k)])
         let actual = model.stream.render([.isolate(k), .replace(k, replacement)])
-        if let (diffOutside, inkInside, inkTotal) = RedactRaster.compare(file: f, pageObj: pageObj, mediaBox: model.mediaBox, a: original, b: actual, scale: 2, zones: removedBoxes) {
+        let tCmp = Date()
+        defer { if ProcessInfo.processInfo.environment["PDFW_REDACT_DEBUG"] != nil { print("Redact-Debug: Zeichen „\(e.name.prefix(20))“ \(glyphs.count) Glyphen, Vermessung+Nachweis \(Int(Date().timeIntervalSince(tCmp) * 1000)) ms (Nachweis)") } }
+        if let (diffOutside, inkInside, inkTotal) = RedactRaster.compare(file: f, pageObj: pageObj, mediaBox: model.mediaBox, a: original, b: actual, scale: 2, zones: removedBoxes, region: region) {
             if let dbg = ProcessInfo.processInfo.environment["PDFW_DEBUG_GLYPH"], e.name.hasPrefix(dbg) {
                 if let d = f.standalone(pageObj: pageObj, contents: [original, actual], mediaBox: model.mediaBox) { try? d.write(to: URL(fileURLWithPath: "/tmp/glyph-debug.pdf")) }
                 Log.w("Glyph-Debug „\(e.name)“: entfernt \(removed.sorted()) von \(glyphs.count), Kästen \(removedBoxes.map { $0.integral }), außerhalb \(diffOutside) innen \(inkInside) gesamt \(inkTotal)\nORIGINAL: \(String(decoding: model.stream.source(k), as: UTF8.self).prefix(300))\nERSATZ: \(String(decoding: replacement, as: UTF8.self).prefix(300))")
@@ -802,9 +833,9 @@ final class Redactor {
 enum RedactPatterns {
     static let presets: [(String, String)] = [
         ("Eigener Text", ""),
-        ("IBAN", #"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,7}(?:\s?[A-Z0-9]{1,4})?\b"#),
+        ("IBAN", #"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b"#),           // nur Leerzeichen, kein Zeilenumbruch
         ("E-Mail-Adressen", #"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#),
-        ("Telefonnummern", #"(?<![\d\w])(?:\+\d{2}\s?|0)\d{2,5}[\s/\-]?\d{3,}(?:[\s\-]?\d{2,})*"#),
+        ("Telefonnummern", #"(?<![\w/.\-])(?<![0-9A-Z]{4}[ ])(?:\+\d{2}[ ]?|0)\d{2,5}[ /\-]?\d{3,}(?:[ \-]?\d{2,})*(?!\d)"#),   // nicht hinter einem 4er-Block (IBAN)
         ("Datumsangaben", #"\b\d{1,2}\.\s?\d{1,2}\.\s?\d{2,4}\b"#),
     ]
 
@@ -950,5 +981,24 @@ enum SaveTest {
         try? FileManager.default.createDirectory(atPath: dir + "/Ergebnisse", withIntermediateDirectories: true)
         try? text.write(toFile: dir + "/Ergebnisse/sichern-ergebnis.txt", atomically: true, encoding: .utf8)
         exit(ok ? 0 : 1)
+    }
+}
+
+
+/// PDFW_PATTERN_TEST=<Ordner>: Treffer der Suchvorgaben je Datei ausgeben (zum Nachschärfen der Muster)
+enum PatternTest {
+    static func runIfRequested() {
+        guard let dir = ProcessInfo.processInfo.environment["PDFW_PATTERN_TEST"] else { return }
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".pdf") }.sorted()
+        for name in files {
+            guard let doc = PDFDocument(url: URL(fileURLWithPath: dir).appendingPathComponent(name)) else { continue }
+            print("== \(name)")
+            for (title, pat) in RedactPatterns.presets where !pat.isEmpty {
+                let hits = RedactPatterns.find(in: doc, pattern: pat, isRegex: true, caseSensitive: true)
+                let texts = Array(Set(hits.map { $0.text.trimmingCharacters(in: .whitespaces) })).sorted()
+                print("  \(title): \(hits.count) → \(texts.prefix(12).map { "„\($0)“" }.joined(separator: " "))")
+            }
+        }
+        exit(0)
     }
 }

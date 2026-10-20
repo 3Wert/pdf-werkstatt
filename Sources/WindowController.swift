@@ -139,7 +139,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
     /// Nach einem Eingriff in den Seiteninhalt: neues PDFDocument einhängen, Seite/Zoom/Position behalten
     /// Nach dem Öffnen: Scan ohne Textebene → einmal anbieten
     func offerOCRIfScanned() {
-        guard let d = wdoc, d.scanCandidate, let w = window, ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil, ProcessInfo.processInfo.environment["PDFW_REDACT_UITEST"] == nil, ProcessInfo.processInfo.environment["PDFW_OCR_UITEST"] == nil, ProcessInfo.processInfo.environment["PDFW_COMPLEX_UITEST"] == nil else { return }
+        guard let d = wdoc, d.scanCandidate, let w = window, ProcessInfo.processInfo.environment["PDFW_SELFTEST"] == nil, ProcessInfo.processInfo.environment["PDFW_REDACT_UITEST"] == nil, ProcessInfo.processInfo.environment["PDFW_OCR_UITEST"] == nil, ProcessInfo.processInfo.environment["PDFW_COMPLEX_UITEST"] == nil, ProcessInfo.processInfo.environment["PDFW_EDIT_UITEST"] == nil else { return }
         d.scanCandidate = false
         let a = NSAlert()
         a.messageText = "Gescanntes Dokument ohne Textebene"
@@ -464,11 +464,13 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
         a.alertStyle = rep.leaks.isEmpty ? .informational : .critical
         a.messageText = rep.leaks.isEmpty ? (marks.count == 1 ? "Schwärzung angewendet" : "\(marks.count) Schwärzungen angewendet") : "Text noch auffindbar"
         var lines = ["Entfernt: \(rep.summary)."]
-        if rep.leaks.isEmpty { lines.append("Prüfung: In den geschwärzten Bereichen ist kein Text mehr auffindbar; die Datei wurde ohne Altstände neu geschrieben.") }
+        if rep.leaks.isEmpty { lines.append("Prüfung sauber – kein Text mehr auffindbar, Datei ohne Altstände.") }
         else { lines.append("⚠️ " + rep.leaks.joined(separator: "; ") + " – bitte als Bild-PDF exportieren.") }
-        if !rep.notes.isEmpty { lines.append(rep.notes.joined(separator: "\n")) }
-        lines.append("\(Int(Date().timeIntervalSince(t0) * 1000)) ms")
+        let important = rep.notes.filter { !$0.hasPrefix("Metadaten entfernt") }
+        if !important.isEmpty { lines.append(important.joined(separator: "\n")) }
+        if rep.notes.contains(where: { $0.hasPrefix("Metadaten entfernt") }) { lines.append("Metadaten entfernt.") }
         a.informativeText = lines.joined(separator: "\n")
+        Log.w("Schwärzen: \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
         a.beginSheetModal(for: w)
         return rep.leaks.isEmpty
     }
@@ -504,7 +506,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSWindo
                 if !rep.pages.isEmpty { d.replaceData(out, old: fresh, action: "Text erkennen") }
                 let a = NSAlert()
                 a.messageText = rep.pages.isEmpty ? "Kein Text erkannt" : "Text erkannt"
-                a.informativeText = rep.summary + (rep.notes.isEmpty ? "" : "\n" + rep.notes.joined(separator: "\n")) + (rep.pages.isEmpty ? "" : "\nDer Text liegt unsichtbar über dem Bild – jetzt durchsuchbar, kopierbar und für „Suchen und schwärzen“ erreichbar.")
+                a.informativeText = rep.summary + "." + (rep.notes.isEmpty ? "" : "\n" + rep.notes.joined(separator: "\n")) + (rep.pages.isEmpty ? "" : "\nJetzt durchsuchbar, kopierbar, schwärzbar.")
                 a.beginSheetModal(for: w)
                 completion?(rep)
             }

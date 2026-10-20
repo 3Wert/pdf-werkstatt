@@ -251,8 +251,10 @@ final class WDocument: NSDocument {
         let pages = f.pageObjects()
         var dicts: [Int: [String: PDFObj]] = [:]
         var newObjs: [(Int, PDFObj)] = []
-        var next = f.firstFreeObject
+        let next = f.firstFreeObject
         var count = 0
+        var maps: [ObjectIdentifier: [Int: Int]] = [:]      // je Herkunftsdatei: Quellnummer → Zielnummer (geteilte Schriften nur einmal)
+        var used = next
         for i in 0..<min(pages.count, pdf.pageCount) {
             guard let p = pdf.page(at: i), let (o, j) = pageOrigin[ObjectIdentifier(p)] else { if dbg { Swift.print("Origin-Debug: Seite \(i) ohne Herkunft") }; continue }
             guard let src = o.file else { if dbg { Swift.print("Origin-Debug: Herkunftsdatei nicht lesbar: \(String(describing: try? PDFFile(data: o.data, password: o.password)))") }; continue }
@@ -262,10 +264,12 @@ final class WDocument: NSDocument {
                   abs(mbA.minX - mbB.minX) < 0.05, abs(mbA.minY - mbB.minY) < 0.05, abs(mbA.width - mbB.width) < 0.05, abs(mbA.height - mbB.height) < 0.05,
                   let contents = sd["Contents"] else { if dbg { Swift.print("Origin-Debug: Seite \(i): Box/Inhalt passt nicht – \(String(describing: f.mediaBox(ofPage: pages[i]))) vs \(String(describing: src.mediaBox(ofPage: srcPages[j])))") }; continue }
             let res = PDFObj.dict(src.pageResources(srcPages[j]))
-            let (newRoot, objs) = f.imported(.array([contents, res]), from: src, firstFree: next)
+            var map = maps[ObjectIdentifier(o)] ?? [:]
+            let (newRoot, objs) = f.imported(.array([contents, res]), from: src, firstFree: used, map: &map)
+            maps[ObjectIdentifier(o)] = map
+            used = max(used, (map.values.max() ?? used - 1) + 1)
             guard case .array(let pair) = newRoot, pair.count == 2 else { continue }
             newObjs += objs
-            next += objs.count
             pd["Contents"] = pair[0]
             pd["Resources"] = pair[1]
             dicts[pages[i]] = pd

@@ -241,9 +241,24 @@ enum PDFWriter {
             if s.hasSuffix(".") { s.removeLast() }
             out += Array(s.utf8)
         case .string(let s):
-            out.append(0x3C)
-            for c in s { out += Array(String(format: "%02X", c).utf8) }
-            out.append(0x3E)
+            // Lesbare Strings als Literal (halb so groß wie Hex), Binärdaten hexadezimal
+            if s.allSatisfy({ ($0 >= 0x20 && $0 < 0x7F) || $0 == 0x0A || $0 == 0x0D || $0 == 0x09 }) {
+                out.append(0x28)
+                for c in s {
+                    switch c {
+                    case 0x5C, 0x28, 0x29: out.append(0x5C); out.append(c)
+                    case 0x0A: out += [0x5C, 0x6E]
+                    case 0x0D: out += [0x5C, 0x72]
+                    case 0x09: out += [0x5C, 0x74]
+                    default: out.append(c)
+                    }
+                }
+                out.append(0x29)
+            } else {
+                out.append(0x3C)
+                for c in s { out += Array(String(format: "%02X", c).utf8) }
+                out.append(0x3E)
+            }
         case .name(let n):
             out.append(0x2F)
             for c in n.utf8 {
@@ -401,8 +416,14 @@ final class PDFFile {
     /// Liefert das umnummerierte Wurzelobjekt und die neuen Objekte.
     func imported(_ root: PDFObj, from src: PDFFile, firstFree: Int) -> (PDFObj, [(Int, PDFObj)]) {
         var map: [Int: Int] = [:]
-        var next = firstFree
-        let nums = src.closure(of: root).sorted()
+        return imported(root, from: src, firstFree: firstFree, map: &map)
+    }
+
+    /// Wie oben, aber mit geteilter Zuordnung Quell- → Zielnummer: Objekte, die mehrere Seiten teilen (Schriften, Bilder),
+    /// werden nur einmal übernommen. Liefert nur die *neu* hinzugekommenen Objekte.
+    func imported(_ root: PDFObj, from src: PDFFile, firstFree: Int, map: inout [Int: Int]) -> (PDFObj, [(Int, PDFObj)]) {
+        var next = max(firstFree, (map.values.max() ?? firstFree - 1) + 1)
+        let nums = src.closure(of: root).sorted().filter { map[$0] == nil }
         for n in nums { map[n] = next; next += 1 }
         func renum(_ o: PDFObj) -> PDFObj {
             switch o {
@@ -750,7 +771,9 @@ final class PDFFile {
             for (k, v) in up.extra { pd[k] = v }
             let cn = next; next += 1
             pd["Contents"] = .ref(cn, 0)
-            emit(cn, .stream([:], up.content))
+            let packed = RedactRaster.zlib(up.content)
+            if !packed.isEmpty, packed.count < up.content.count { emit(cn, .stream(["Filter": .name("FlateDecode")], packed)) }
+            else { emit(cn, .stream([:], up.content)) }
             emit(num, .dict(pd))
         }
         let xrefPos = out.count
@@ -838,6 +861,10 @@ struct ContentElement {
     var bounds: CGRect = .null      // Seitenkoordinaten, später per Rendern bestimmt
     var name: String                // z. B. Bildname oder Textauszug
     var ctm = CGAffineTransform.identity   // Transformation (cm-Stapel) an der Stelle des Elements
+    var textOffset = 0.0                   // Vorschub (Textraum, nach Tz) seit dem letzten Positionsoperator – für rechnerische Kästen
+    var textAdvance = 0.0                  // eigener Vorschub des Textstücks (Textraum, nach Tz); nil-Fall: 0
+    var textMeasured = false               // Vorschub war berechenbar (Schriftbreiten bekannt)
+    var invisible: Bool { kind == .text && (textState?.tr == 3 || textState?.tr == 7) }   // z. B. OCR-Ebene
 }
 
 struct TextState {
@@ -870,7 +897,12 @@ final class ContentStream {
     static let showOps: Set<String> = ["Tj", "TJ", "'", "\""]
     static let posOps: Set<String> = ["Td", "TD", "Tm", "T*"]
 
-    init(_ bytes: [UInt8]) {
+    /// Breite eines Strings in 1/1000 Textraum für eine Schrift (Ressourcenname) – nil, wenn unbekannt
+    typealias WidthProvider = (_ font: String, _ string: [UInt8]) -> (width: Double, spaces: Int)?
+    private var widths: WidthProvider?
+
+    init(_ bytes: [UInt8], widths: WidthProvider? = nil) {
+        self.widths = widths
         tokenize(bytes)
         analyze()
     }
@@ -910,6 +942,32 @@ final class ContentStream {
         var hasClip = false
         var lastTextOpWasPos = true      // vor dem ersten Tj in BT gilt: Position definiert
         var pendingTextElem: Int? = nil  // Index in elements, canRemove/canMove nach dem nächsten Operator festlegen
+        var penOffset = 0.0              // Vorschub seit dem letzten Positionsoperator (Textraum, nach Tz)
+        var penKnown = true
+
+        /// Vorschub eines Zeige-Operators: Σ (w/1000·Tfs + Tc + Tw·Leerzeichen)·Th, TJ-Zahlen: −n/1000·Tfs·Th
+        func advance(_ operands: Range<Int>, _ op: String) -> Double? {
+            guard let wp = widths, let f = ts.font?.nameValue else { return nil }
+            let th = ts.tz / 100
+            var total = 0.0
+            func str(_ b: [UInt8]) -> Bool {
+                guard let r = wp(f, b) else { return false }
+                total += (r.width / 1000 * ts.size + Double(b.count) * ts.tc + Double(r.spaces) * ts.tw) * th
+                return true
+            }
+            for i in operands {
+                switch tokens[i].obj {
+                case .string(let b): if !str(b) { return nil }
+                case .array(let a):
+                    for x in a {
+                        if case .string(let b) = x { if !str(b) { return nil } }
+                        else if let d = x.doubleValue { total -= d / 1000 * ts.size * th }
+                    }
+                default: break
+                }
+            }
+            return total
+        }
 
         func finishPendingText(nextOp: String) {
             guard let k = pendingTextElem else { return }
@@ -928,7 +986,7 @@ final class ContentStream {
                 finishPendingText(nextOp: op)
             }
             switch op {
-            case "BT": inText = true; ts.tlm = .identity; lastTextOpWasPos = true
+            case "BT": inText = true; ts.tlm = .identity; lastTextOpWasPos = true; penOffset = 0; penKnown = true
             case "ET": inText = false; pendingTextElem = nil
             case "q": tsStack.append(ts); ctmStack.append(ctm)
             case "Q": if let s = tsStack.popLast() { ts = s }; if let c = ctmStack.popLast() { ctm = c }
@@ -944,18 +1002,22 @@ final class ContentStream {
             case "TL": ts.tl = num(operands, 0)
             case "Ts": ts.ts = num(operands, 0)
             case "Tr": ts.tr = Int(num(operands, 0))
-            case "Td": ts.tlm = CGAffineTransform(translationX: num(operands, 0), y: num(operands, 1)).concatenating(ts.tlm); lastTextOpWasPos = true
-            case "TD": ts.tl = -num(operands, 1); ts.tlm = CGAffineTransform(translationX: num(operands, 0), y: num(operands, 1)).concatenating(ts.tlm); lastTextOpWasPos = true
+            case "Td": ts.tlm = CGAffineTransform(translationX: num(operands, 0), y: num(operands, 1)).concatenating(ts.tlm); lastTextOpWasPos = true; penOffset = 0; penKnown = true
+            case "TD": ts.tl = -num(operands, 1); ts.tlm = CGAffineTransform(translationX: num(operands, 0), y: num(operands, 1)).concatenating(ts.tlm); lastTextOpWasPos = true; penOffset = 0; penKnown = true
             case "Tm":
                 if operands.count >= 6 { ts.tlm = CGAffineTransform(a: num(operands, 0), b: num(operands, 1), c: num(operands, 2), d: num(operands, 3), tx: num(operands, 4), ty: num(operands, 5)) }
-                lastTextOpWasPos = true
-            case "T*": ts.tlm = CGAffineTransform(translationX: 0, y: -ts.tl).concatenating(ts.tlm); lastTextOpWasPos = true
+                lastTextOpWasPos = true; penOffset = 0; penKnown = true
+            case "T*": ts.tlm = CGAffineTransform(translationX: 0, y: -ts.tl).concatenating(ts.tlm); lastTextOpWasPos = true; penOffset = 0; penKnown = true
             case "Tj", "TJ", "'", "\"":
-                if op == "'" || op == "\"" { ts.tlm = CGAffineTransform(translationX: 0, y: -ts.tl).concatenating(ts.tlm) }
+                if op == "'" || op == "\"" { ts.tlm = CGAffineTransform(translationX: 0, y: -ts.tl).concatenating(ts.tlm); penOffset = 0; penKnown = true }
                 if op == "\"", operands.count >= 3 { ts.tw = num(operands, 0); ts.tc = num(operands, 1) }
                 let txt = textPreview(operands)
                 let movable = lastTextOpWasPos && (op == "Tj" || op == "TJ")
-                elements.append(ContentElement(kind: .text, tokens: operands.lowerBound..<(idx + 1), inText: inText, canRemove: false, canMove: movable, textState: ts, name: txt))
+                var el = ContentElement(kind: .text, tokens: operands.lowerBound..<(idx + 1), inText: inText, canRemove: false, canMove: movable, textState: ts, name: txt)
+                let adv = advance(op == "\"" ? (operands.lowerBound + 2)..<operands.upperBound : operands, op)
+                el.textOffset = penOffset; el.textAdvance = adv ?? 0; el.textMeasured = penKnown && adv != nil
+                if let adv { penOffset += adv } else { penKnown = false }
+                elements.append(el)
                 pendingTextElem = elements.count - 1
                 lastTextOpWasPos = false
             case "W", "W*": hasClip = true
@@ -1142,10 +1204,26 @@ final class PageContentModel {
         self.init(file: f, pageObj: pages[pageIndex], pageIndex: pageIndex, content: c, hash: PageContentModel.hash(c))
     }
 
+    /// Schriftmaße je Ressourcenname (nil = unbekannt)
+    private(set) var fontMetrics: [String: FontMetrics?] = [:]
+
     private init(file f: PDFFile, pageObj: Int, pageIndex: Int, content c: [UInt8], hash: Int) {
         self.pageIndex = pageIndex
         contentHash = hash
-        stream = ContentStream(c)
+        let resources = f.pageResources(pageObj)
+        var cache: [String: FontMetrics?] = [:]
+        func metrics(_ name: String) -> FontMetrics? {
+            if let c = cache[name] { return c }
+            let m = f.fontDict(name, resources: resources).flatMap { FontMetrics(font: $0, file: f) }
+            cache[name] = m
+            return m
+        }
+        stream = ContentStream(c, widths: { name, bytes in
+            guard let m = metrics(name) else { return nil }
+            let codes = m.codes(bytes)
+            return (codes.reduce(0.0) { $0 + m.width($1) }, m.wordSpaceApplies ? codes.filter { $0 == 32 }.count : 0)
+        })
+        fontMetrics = cache
         elements = stream.elements
         var mb = CGRect(x: 0, y: 0, width: 612, height: 792)
         var n: Int? = pageObj
@@ -1167,20 +1245,38 @@ final class PageContentModel {
                 elements[k].kind = .form
             }
         }
+        analyticTextBounds()
         measure(f, pageObj: pageObj)
     }
 
-    /// Bounding-Box jedes Elements: alle isolierten Varianten als Seiten EINER kleinen Datei rendern.
+    /// Kästen von Textstücken rechnen statt rendern: [Vorschub…Vorschub+Breite] × [Unterlänge…Oberlänge] im Textraum,
+    /// dann Zeilenmatrix und CTM. Unabhängig von Farbe und Textmodus – findet auch unsichtbaren Text (OCR-Ebene).
+    private func analyticTextBounds() {
+        for k in elements.indices {
+            let e = elements[k]
+            guard e.kind == .text, e.textMeasured, let st = e.textState, st.size != 0, let name = st.font?.nameValue, let m = fontMetrics[name] ?? nil else { continue }
+            let x0 = e.textOffset, x1 = e.textOffset + max(e.textAdvance, 0.25 * abs(st.size) * st.tz / 100)
+            let y0 = m.descent / 1000 * st.size + st.ts, y1 = m.ascent / 1000 * st.size + st.ts
+            let t = st.tlm.concatenating(e.ctm)
+            let pts = [CGPoint(x: x0, y: y0), CGPoint(x: x1, y: y0), CGPoint(x: x0, y: y1), CGPoint(x: x1, y: y1)].map { $0.applying(t) }
+            let xs = pts.map { $0.x }, ys = pts.map { $0.y }
+            let r = CGRect(x: xs.min()!, y: ys.min()!, width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
+            if r.isUsable, r.width > 0, r.height > 0, r.width < mediaBox.width * 3, r.height < mediaBox.height * 3 { elements[k].bounds = r.insetBy(dx: -0.5, dy: -0.5) }
+        }
+    }
+
+    /// Bounding-Box der übrigen Elemente (Pfade, Bilder, Text ohne bekannte Breiten): isolierte Varianten als Seiten EINER kleinen Datei rendern.
     private func measure(_ f: PDFFile, pageObj: Int) {
-        let total = elements.count
+        let todo = elements.indices.filter { !elements[$0].bounds.isUsable }
+        let total = todo.count
         guard total > 0 else { return }
         let bytesPerVariant = stream.tokens.count * 8
-        if total * bytesPerVariant > 160_000_000 || total > 2500 { note = "Seite zu komplex (\(total) Elemente)"; return }
+        if total * bytesPerVariant > 160_000_000 || total > 2500 { note = "Seite zu komplex (\(elements.count) Elemente)"; return }
         let scale: CGFloat = total > 600 ? 0.33 : 0.5
         let w = Int(ceil(mediaBox.width * scale)), h = Int(ceil(mediaBox.height * scale))
         guard w > 0, h > 0, w * h < 4_000_000 else { return }
         var variants = [stream.render(elements.indices.map { .remove($0) })]
-        for k in elements.indices { variants.append(stream.render([.isolate(k)])) }
+        for k in todo { variants.append(stream.render([.isolate(k)])) }
         guard let data = f.standalone(pageObj: pageObj, contents: variants, mediaBox: mediaBox),
               let prov = CGDataProvider(data: data as CFData), let doc = CGPDFDocument(prov) else { note = "Vermessung fehlgeschlagen"; return }
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(),
@@ -1197,8 +1293,8 @@ final class PageContentModel {
             return Array(UnsafeBufferPointer(start: buf, count: w * h))
         }
         guard let blank = raster(0) else { return }
-        for k in elements.indices {
-            guard let img = raster(k + 1) else { continue }
+        for (vi, k) in todo.enumerated() {
+            guard let img = raster(vi + 1) else { continue }
             var minX = w, minY = h, maxX = -1, maxY = -1
             for y in 0..<h {
                 let row = y * w
@@ -1219,7 +1315,7 @@ final class PageContentModel {
     func element(at p: CGPoint) -> Int? {
         var best: Int? = nil
         var bestArea = CGFloat.greatestFiniteMagnitude
-        for (k, e) in elements.enumerated() where e.bounds.isUsable && e.bounds.insetBy(dx: -2, dy: -2).contains(p) {
+        for (k, e) in elements.enumerated() where !e.invisible && e.bounds.isUsable && e.bounds.insetBy(dx: -2, dy: -2).contains(p) {
             let a = e.bounds.width * e.bounds.height
             if a < bestArea { bestArea = a; best = k }
         }
@@ -1230,7 +1326,7 @@ final class PageContentModel {
     func elements(in r: CGRect, share: CGFloat = 0.5) -> [Int] {
         elements.indices.filter { k in
             let b = elements[k].bounds
-            guard !b.isNull else { return false }
+            guard !b.isNull, !elements[k].invisible else { return false }
             let i = b.intersection(r)
             return !i.isNull && i.width * i.height > share * max(b.width * b.height, 0.01)
         }

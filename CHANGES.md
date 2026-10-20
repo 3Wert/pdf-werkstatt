@@ -1,5 +1,12 @@
 # Änderungen
 
+## 1.7 – 20.10.2026
+- Gesicherte Dateien sind nicht mehr größer als das Original: geteilte Schriften und Bilder werden beim Zurücksetzen des Originalinhalts nur einmal übernommen, neue Inhaltsströme werden gepackt, lesbare Strings als Literal statt Hex geschrieben (Mietvertrag 32 → 28,5 MB, Rechnung 179 → 93 KB)
+- Schwärzen 2–4× schneller: Textkästen werden gerechnet statt gerendert, Zeichen-Vermessung und Nachweis nur im Zeilenbereich (Eurowings 7,3 → 3,0 s, Mietvertrag 11,8 → 3,6 s)
+- Suchen und schwärzen: Vorschau der Treffer vor dem Markieren; IBAN-Muster läuft nicht mehr über Zeilenumbrüche, Telefonnummern-Muster hält IBAN-Blöcke nicht mehr für Nummern
+- Kürzere Ergebnis-Meldungen nach Schwärzen und Texterkennung
+- Inhalts-Editor: unsichtbarer Text (OCR-Ebene) ist nicht mehr anklickbar
+
 ## 1.6.1 – 20.10.2026
 - Lange Arbeiten (Seite vermessen, Inhalt ändern, Schwärzen, Prüfung) laufen im Hintergrund mit Fortschrittsfenster – die App hängt nicht mehr
 - Seiten, deren Text aus Kurven besteht (so schreibt macOS Dateien mit nicht übernehmbaren Schriften), melden klar, was geht und was nicht, statt still nichts zu tun

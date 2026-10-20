@@ -141,6 +141,15 @@ enum Dialogs {
             let n = NSAlert(); n.messageText = "Keine Treffer"; n.informativeText = "Nichts gefunden für „\(field.stringValue)“. Bei gescannten Seiten ohne Textebene hilft nur das Schwärzen-Werkzeug von Hand."
             n.runModal(); return
         }
+        // Vorschau: was würde markiert?
+        let distinct = Array(Set(hits.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) })).sorted()
+        let pageCount = Set(hits.map { $0.page }).count
+        let pv = NSAlert()
+        pv.messageText = hits.count == 1 ? "1 Treffer" : "\(hits.count) Treffer auf \(pageCount) Seite\(pageCount == 1 ? "" : "n")"
+        pv.informativeText = distinct.prefix(8).map { "• \($0)" }.joined(separator: "\n") + (distinct.count > 8 ? "\n… und \(distinct.count - 8) weitere" : "")
+        pv.addButton(withTitle: r == .alertSecondButtonReturn ? "Markieren und anwenden" : "Markieren")
+        pv.addButton(withTitle: "Abbrechen")
+        guard pv.runModal() == .alertFirstButtonReturn else { return }
         canvas.um?.beginUndoGrouping()
         for h in hits {
             guard let p = doc.page(at: h.page) else { continue }
@@ -153,10 +162,9 @@ enum Dialogs {
         canvas.wdoc?.touch()
         canvas.overlay.needsDisplay = true
         if r == .alertSecondButtonReturn { wc.applyRedactions(confirm: false); return }
-        let pages = Set(hits.map { $0.page }).count
         let n = NSAlert()
         n.messageText = hits.count == 1 ? "Eine Stelle markiert" : "\(hits.count) Stellen markiert"
-        n.informativeText = "Auf \(pages) Seite\(pages == 1 ? "" : "n"). Die Markierungen prüfen (rot umrandet), dann Werkzeuge › Schwärzungen anwenden."
+        n.informativeText = "Rot umrandet. Prüfen, dann Werkzeuge › Schwärzungen anwenden (⇧⌘R)."
         n.beginSheetModal(for: window)
     }
 
